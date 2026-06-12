@@ -11,8 +11,12 @@ def transcribe_audio(video_path):
 
     print(f"🎙️  Transcribing audio from: {video_path}")
 
-    # Run on CPU with INT8 quantization for speed
-    model = WhisperModel("base", device="cpu", compute_type="int8")
+    # Cap CPU threads — long transcriptions otherwise peg every core for
+    # tens of minutes and have caused thermal/power shutdowns.
+    threads = max(2, (os.cpu_count() or 8) // 2)
+    print(f"   cpu_threads={threads}")
+    model = WhisperModel("base", device="cpu", compute_type="int8",
+                         cpu_threads=threads, num_workers=1)
 
     segments, info = model.transcribe(video_path, word_timestamps=True)
 
@@ -41,7 +45,7 @@ def transcribe_audio(video_path):
     return transcript
 
 
-def generate_srt_from_video(video_path, output_path, max_chars=20, max_duration=2.0):
+def generate_srt_from_video(video_path, output_path, max_chars=20, max_duration=2.0, max_words=None):
     """
     Transcribe a video and generate SRT directly.
     Used for dubbed videos that don't have a pre-existing transcript.
@@ -56,10 +60,10 @@ def generate_srt_from_video(video_path, output_path, max_chars=20, max_duration=
     duration = frame_count / fps if fps else 0
     cap.release()
 
-    return generate_srt(transcript, 0, duration, output_path, max_chars, max_duration)
+    return generate_srt(transcript, 0, duration, output_path, max_chars, max_duration, max_words)
 
 
-def generate_srt(transcript, clip_start, clip_end, output_path, max_chars=20, max_duration=2.0):
+def generate_srt(transcript, clip_start, clip_end, output_path, max_chars=20, max_duration=2.0, max_words=None):
     """
     Generates an SRT file from the transcript for a specific time range.
     Groups words into short lines suitable for vertical video.
@@ -97,7 +101,7 @@ def generate_srt(transcript, clip_start, clip_end, output_path, max_chars=20, ma
             current_text_len = sum(len(w['word']) + 1 for w in current_block)
             duration = end - block_start
             
-            if current_text_len + len(word['word']) > max_chars or duration > max_duration:
+            if current_text_len + len(word['word']) > max_chars or duration > max_duration or (max_words and len(current_block) >= max_words):
                 # Finalize current block
                 # End time of block is start of this word (gap) or end of last word?
                 # Usually end of last word.

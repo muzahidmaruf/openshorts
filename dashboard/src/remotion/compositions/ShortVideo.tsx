@@ -8,7 +8,7 @@ import { VideoEffects } from "./VideoEffects";
 
 /**
  * Main composition that layers all post-processing on top of the base video.
- * Uses @remotion/media Video for browser-side rendering compatibility.
+ * Uses @remotion/media Video for browser-side web rendering compatibility.
  */
 export const ShortVideo: React.FC<Record<string, unknown>> = (rawProps) => {
   const { videoUrl, subtitles, hook, effects } =

@@ -8,11 +8,12 @@ export interface CaptionWord {
 }
 
 // --- Subtitle config ---
-export type SubtitleAnimation = "none" | "word-highlight" | "pop" | "karaoke";
+export type SubtitleAnimation = "none" | "word-highlight" | "pop" | "karaoke" | "bounce" | "fadeup" | "emphasis";
 export type SubtitlePosition = "top" | "middle" | "bottom";
 
 export interface SubtitleStyle {
   fontFamily: string;
+  highlightFontFamily?: string;
   fontSize: number;
   fontColor: string;
   highlightColor: string;
@@ -27,6 +28,12 @@ export interface SubtitleConfig {
   captions: CaptionWord[];
   position: SubtitlePosition;
   style: SubtitleStyle;
+  wordsPerLine?: number;
+  // Optional free-form anchor as percentages of the 1080x1920 canvas
+  // (center point of the caption block). When present these override the
+  // `position` preset, letting the user drag captions anywhere.
+  posX?: number;
+  posY?: number;
 }
 
 // --- Hook config ---
@@ -79,6 +86,7 @@ export const captionWordSchema = z.object({
 
 export const subtitleStyleSchema = z.object({
   fontFamily: z.string(),
+  highlightFontFamily: z.string().optional(),
   fontSize: z.number(),
   fontColor: z.string(),
   highlightColor: z.string(),
@@ -86,13 +94,16 @@ export const subtitleStyleSchema = z.object({
   borderWidth: z.number(),
   bgColor: z.string(),
   bgOpacity: z.number().min(0).max(1),
-  animation: z.enum(["none", "word-highlight", "pop", "karaoke"]),
+  animation: z.enum(["none", "word-highlight", "pop", "karaoke", "bounce", "fadeup", "emphasis", "hormozi", "stack"]),
 });
 
 export const subtitleConfigSchema = z.object({
   captions: z.array(captionWordSchema),
   position: z.enum(["top", "middle", "bottom"]),
   style: subtitleStyleSchema,
+  wordsPerLine: z.number().int().min(2).max(8).optional(),
+  posX: z.number().min(0).max(100).optional(),
+  posY: z.number().min(0).max(100).optional(),
 });
 
 export const hookConfigSchema = z.object({

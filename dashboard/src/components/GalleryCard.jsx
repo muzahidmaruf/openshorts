@@ -1,10 +1,12 @@
 import React, { useRef, useState, useEffect } from 'react';
 import { Download, Youtube, Instagram, Video, Copy, Check, Play } from 'lucide-react';
+import DownloadModal from './DownloadModal';
 
 export default function GalleryCard({ clip }) {
     const [copied, setCopied] = useState(null);
     const [isVisible, setIsVisible] = useState(false);
     const [hasLoaded, setHasLoaded] = useState(false);
+    const [showDownloadModal, setShowDownloadModal] = useState(false);
     const cardRef = useRef(null);
     const videoRef = useRef(null);
 
@@ -43,25 +45,8 @@ export default function GalleryCard({ clip }) {
         setTimeout(() => setCopied(null), 2000);
     };
 
-    const handleDownload = async (e) => {
-        e.preventDefault();
-        try {
-            const response = await fetch(clip.url);
-            if (!response.ok) throw new Error('Download failed');
-            const blob = await response.blob();
-            const url = window.URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.style.display = 'none';
-            a.href = url;
-            a.download = `clip_${clip.job_id}_${clip.index + 1}.mp4`;
-            document.body.appendChild(a);
-            a.click();
-            window.URL.revokeObjectURL(url);
-            document.body.removeChild(a);
-        } catch (err) {
-            console.error('Download error:', err);
-            window.open(clip.url, '_blank');
-        }
+    const handleDownload = () => {
+        setShowDownloadModal(true);
     };
 
     return (
@@ -151,6 +136,13 @@ export default function GalleryCard({ clip }) {
                     <Download size={14} className="shrink-0" /> Download Clip
                 </button>
             </div>
+
+            <DownloadModal
+                isOpen={showDownloadModal}
+                onClose={() => setShowDownloadModal(false)}
+                videoUrl={clip.url}
+                filename={`clip_${clip.job_id}_${clip.index + 1}.mp4`}
+            />
         </div>
     );
 }

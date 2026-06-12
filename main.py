@@ -7,8 +7,8 @@ import re
 import sys
 from scenedetect import VideoManager, SceneManager
 from scenedetect.detectors import ContentDetector
-from ultralytics import YOLO
-import torch
+# ultralytics + torch are deferred — they're heavy (~several seconds) and not needed
+# for single-reel mode. Imported on first YOLO use via _get_yolo_model().
 import os
 import numpy as np
 from tqdm import tqdm
@@ -25,11 +25,14 @@ warnings.filterwarnings("ignore", category=UserWarning, module='google.protobuf'
 # Load environment variables
 load_dotenv()
 
+# Import video cleaner for filler word removal
+from video_cleaner import clean_video as clean_video_filler_words
+
 # --- Constants ---
 ASPECT_RATIO = 9 / 16
 
 GEMINI_PROMPT_TEMPLATE = """
-You are a senior short-form video editor. Read the ENTIRE transcript and word-level timestamps to choose the 3–15 MOST VIRAL moments for TikTok/IG Reels/YouTube Shorts. Each clip must be between 15 and 60 seconds long.
+You are a senior short-form video editor. Read the ENTIRE transcript and word-level timestamps to choose the {num_clips} MOST VIRAL moments for TikTok/IG Reels/YouTube Shorts. Each clip must be between 15 and 60 seconds long.
 
 ⚠️ FFMPEG TIME CONTRACT — STRICT REQUIREMENTS:
 - Return timestamps in ABSOLUTE SECONDS from the start of the video (usable in: ffmpeg -ss <start> -to <end> -i <input> ...).
@@ -67,13 +70,58 @@ OUTPUT — RETURN ONLY VALID JSON (no markdown, no comments). Order clips by pre
 }}
 """
 
-# Load the YOLO model once (Keep for backup or scene analysis if needed)
-model = YOLO('yolov8n.pt')
+# Lazy-loaded heavy models — initialized on first use only.
+# Single-reel mode never touches these, so we avoid the multi-second YOLO/MediaPipe
+# startup cost on every job (the previous eager load happened before transcription
+# could even begin).
+_yolo_model = None
+_mp_face_detection_module = None
+_face_detection = None
 
-# --- MediaPipe Setup ---
-# Use standard Face Detection (BlazeFace) for speed
-mp_face_detection = mp.solutions.face_detection
-face_detection = mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5)
+
+def _get_yolo_model():
+    global _yolo_model
+    if _yolo_model is None:
+        print("[Init] Loading YOLO model (yolov8n.pt)...")
+        from ultralytics import YOLO  # heavy: pulls in torch
+        _yolo_model = YOLO('yolov8n.pt')
+    return _yolo_model
+
+
+def _get_face_detection():
+    global _mp_face_detection_module, _face_detection
+    if _face_detection is None:
+        print("[Init] Loading MediaPipe face detection...")
+        _mp_face_detection_module = mp.solutions.face_detection
+        _face_detection = _mp_face_detection_module.FaceDetection(
+            model_selection=1, min_detection_confidence=0.5
+        )
+    return _face_detection
+
+
+class _LazyAttr:
+    """Drop-in module-level proxy that loads on first attribute access / call."""
+    def __init__(self, loader):
+        self._loader = loader
+        self._inner = None
+
+    def _resolve(self):
+        if self._inner is None:
+            self._inner = self._loader()
+        return self._inner
+
+    def __getattr__(self, name):
+        return getattr(self._resolve(), name)
+
+    def __call__(self, *args, **kwargs):
+        return self._resolve()(*args, **kwargs)
+
+
+# Backwards-compatible names so existing call-sites (model(...), face_detection.process(...))
+# keep working without edits.
+model = _LazyAttr(_get_yolo_model)
+face_detection = _LazyAttr(_get_face_detection)
+mp_face_detection = _LazyAttr(lambda: mp.solutions.face_detection)
 
 class SmoothedCameraman:
     """
@@ -383,7 +431,7 @@ def analyze_scenes_strategy(video_path, scenes):
     if not cap.isOpened():
         return ['TRACK'] * len(scenes)
         
-    for start, end in tqdm(scenes, desc="   Analyzing Scenes"):
+    for start, end in tqdm(scenes, desc="   Analyzing Scenes", ascii=True):
         # Sample 3 frames (start, middle, end)
         frames_to_check = [
             start.get_frames() + 5,
@@ -396,7 +444,13 @@ def analyze_scenes_strategy(video_path, scenes):
             cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
             ret, frame = cap.read()
             if not ret: continue
-            
+
+            # Downscale to 720p before detection to avoid OOM on 4K+ footage
+            h = frame.shape[0]
+            if h > 720:
+                w = int(frame.shape[1] * 720 / h)
+                frame = cv2.resize(frame, (w, 720))
+
             # Detect faces
             candidates = detect_face_candidates(frame)
             face_counts.append(len(candidates))
@@ -454,14 +508,14 @@ def download_youtube_video(url, output_dir="."):
     Downloads a YouTube video using yt-dlp.
     Returns the path to the downloaded video and the video title.
     """
-    print(f"🔍 Debug: yt-dlp version: {yt_dlp.version.__version__}")
-    print("📥 Downloading video from YouTube...")
+    print(f"[Debug] yt-dlp version: {yt_dlp.version.__version__}")
+    print("[Download] Downloading video from YouTube...")
     step_start_time = time.time()
 
     cookies_path = '/app/cookies.txt'
     cookies_env = os.environ.get("YOUTUBE_COOKIES")
     if cookies_env:
-        print("🍪 Found YOUTUBE_COOKIES env var, creating cookies file inside container...")
+        print("[Cookies] Found YOUTUBE_COOKIES env var, creating cookies file...")
         try:
             with open(cookies_path, 'w') as f:
                 f.write(cookies_env)
@@ -471,11 +525,11 @@ def download_youtube_video(url, output_dir="."):
                      content = f.read(100)
                      print(f"   Debug: First 100 chars of cookie file: {content}")
         except Exception as e:
-            print(f"⚠️ Failed to write cookies file: {e}")
+            print(f"[Warning] Failed to write cookies file: {e}")
             cookies_path = None
     else:
         cookies_path = None
-        print("⚠️ YOUTUBE_COOKIES env var not found.")
+        print("[Warning] YOUTUBE_COOKIES env var not found.")
     
     # Common yt-dlp options to work around YouTube bot detection.
     # extractor_args tries multiple player clients in order; tv_embed / android
@@ -516,7 +570,7 @@ def download_youtube_video(url, output_dir="."):
             import traceback
             
             # Print minimal error first to ensure something gets out
-            print("🚨 YOUTUBE DOWNLOAD ERROR 🚨", file=sys.stderr)
+            print("[ERROR] YOUTUBE DOWNLOAD ERROR", file=sys.stderr)
             
             error_msg = f"""
             
@@ -552,13 +606,30 @@ Technical Details: {str(e)}
     expected_file = os.path.join(output_dir, f'{sanitized_title}.mp4')
     if os.path.exists(expected_file):
         os.remove(expected_file)
-        print(f"🗑️  Removed existing file to re-download with H.264 codec")
+        print("[Download] Removed existing file to re-download with H.264 codec")
     
     ydl_opts = {
         **_COMMON_YDL_OPTS,
-        'format': 'bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/bestvideo[vcodec^=avc1]+bestaudio/best[ext=mp4]/best',
-        'outtmpl': output_template,
+        # Format selection: prefer H.264 for compatibility, but allow VP9/AV1 for 1080p+
+        # YouTube serves 1080p+ mostly in VP9/AV1, not H.264.
+        'format': (
+            # 1) Best <=1080p video (H.264 preferred) + best audio
+            'bv*[height<=1080][vcodec^=avc1]+ba*/'
+            # 2) Best <=1080p video (any codec) + best audio
+            'bv*[height<=1080]+ba*/'
+            # 3) Any best video+audio <=1080p merged
+            'b[height<=1080]/'
+            # 4) Absolute fallback
+            'best'
+        ),
         'merge_output_format': 'mp4',
+        'postprocessors': [
+            {
+                'key': 'FFmpegVideoConvertor',
+                'preferedformat': 'mp4',
+            },
+        ],
+        'outtmpl': output_template,
         'overwrites': True,
     }
     
@@ -574,7 +645,7 @@ Technical Details: {str(e)}
                 break
     
     step_end_time = time.time()
-    print(f"✅ Video downloaded in {step_end_time - step_start_time:.2f}s: {downloaded_file}")
+    print(f"[OK] Video downloaded in {step_end_time - step_start_time:.2f}s")
     
     return downloaded_file, sanitized_title
 
@@ -594,12 +665,12 @@ def process_video_to_vertical(input_video, final_output_video):
     if os.path.exists(temp_audio_output): os.remove(temp_audio_output)
     if os.path.exists(final_output_video): os.remove(final_output_video)
 
-    print(f"🎬 Processing clip: {input_video}")
+    print(f"[Process] Processing clip: {input_video}")
     print("   Step 1: Detecting scenes...")
     scenes, fps = detect_scenes(input_video)
     
     if not scenes:
-        print("   ❌ No scenes were detected. Using full video as one scene.")
+        print("   [Warning] No scenes detected. Using full video as one scene.")
         # If scene detection fails or finds nothing, treat whole video as one scene
         cap = cv2.VideoCapture(input_video)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -607,25 +678,34 @@ def process_video_to_vertical(input_video, final_output_video):
         from scenedetect import FrameTimecode
         scenes = [(FrameTimecode(0, fps), FrameTimecode(total_frames, fps))]
 
-    print(f"   ✅ Found {len(scenes)} scenes.")
+    if fps <= 0:
+        fps = 30.0
+        print(f"   [Warning] Invalid FPS detected, defaulting to {fps}")
 
-    print("\n   🧠 Step 2: Preparing Active Tracking...")
+    print(f"   [OK] Found {len(scenes)} scenes.")
+
+    print("\n   [Step 2] Preparing Active Tracking...")
     original_width, original_height = get_video_resolution(input_video)
     
-    OUTPUT_HEIGHT = original_height
+    # Cap at 1080p vertical — processing 4K+ source frames causes OOM / thermal shutdown
+    OUTPUT_HEIGHT = min(original_height, 1920)
+    if OUTPUT_HEIGHT % 2 != 0:
+        OUTPUT_HEIGHT += 1
     OUTPUT_WIDTH = int(OUTPUT_HEIGHT * ASPECT_RATIO)
     if OUTPUT_WIDTH % 2 != 0:
         OUTPUT_WIDTH += 1
+    if original_height > 1920:
+        print(f"   [Info] Source is {original_width}x{original_height} — capping output at {OUTPUT_WIDTH}x{OUTPUT_HEIGHT} to prevent overload")
 
     # Initialize Cameraman
     cameraman = SmoothedCameraman(OUTPUT_WIDTH, OUTPUT_HEIGHT, original_width, original_height)
     
     # --- New Strategy: Per-Scene Analysis ---
-    print("\n   🤖 Step 3: Analyzing Scenes for Strategy (Single vs Group)...")
+    print("\n   [Step 3] Analyzing Scenes for Strategy...")
     scene_strategies = analyze_scenes_strategy(input_video, scenes)
     # scene_strategies is a list of 'TRACK' or 'General' corresponding to scenes
     
-    print("\n   ✂️ Step 4: Processing video frames...")
+    print("\n   [Step 4] Processing video frames...")
     
     command = [
         'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
@@ -650,7 +730,7 @@ def process_video_to_vertical(input_video, final_output_video):
     # Global tracker for single-person shots
     speaker_tracker = SpeakerTracker(cooldown_frames=30)
 
-    with tqdm(total=total_frames, desc="   Processing", file=sys.stdout) as pbar:
+    with tqdm(total=total_frames, desc="   Processing", file=sys.stdout, ascii=True) as pbar:
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
@@ -679,14 +759,35 @@ def process_video_to_vertical(input_video, final_output_video):
                 
                 # Detect every 2nd frame for performance
                 if frame_number % 2 == 0:
-                    candidates = detect_face_candidates(frame)
+                    # Downscale to 720p for detection — face detection doesn't need 4K
+                    if original_height > 720:
+                        det_scale = 720 / original_height
+                        det_w = int(original_width * det_scale)
+                        det_frame = cv2.resize(frame, (det_w, 720))
+                        coord_scale = 1.0 / det_scale
+                    else:
+                        det_frame = frame
+                        coord_scale = 1.0
+
+                    candidates = detect_face_candidates(det_frame)
+                    if coord_scale != 1.0:
+                        for c in candidates:
+                            x, y, w, h = c['box']
+                            c['box'] = [int(x * coord_scale), int(y * coord_scale),
+                                        int(w * coord_scale), int(h * coord_scale)]
+                            c['score'] = c['box'][2] * c['box'][3]
+
                     target_box = speaker_tracker.get_target(candidates, frame_number, original_width)
                     if target_box:
                         cameraman.update_target(target_box)
                     else:
-                        person_box = detect_person_yolo(frame)
-                        if person_box:
-                            cameraman.update_target(person_box)
+                        raw_box = detect_person_yolo(det_frame)
+                        if raw_box and coord_scale != 1.0:
+                            x, y, w, h = raw_box
+                            raw_box = [int(x * coord_scale), int(y * coord_scale),
+                                       int(w * coord_scale), int(h * coord_scale)]
+                        if raw_box:
+                            cameraman.update_target(raw_box)
 
                 # Snap camera on scene change to avoid panning from previous scene position
                 is_scene_start = (frame_number == scene_boundaries[current_scene_index][0])
@@ -700,31 +801,49 @@ def process_video_to_vertical(input_video, final_output_video):
                 else:
                     output_frame = cv2.resize(frame, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
 
-            ffmpeg_process.stdin.write(output_frame.tobytes())
+            try:
+                ffmpeg_process.stdin.write(output_frame.tobytes())
+            except (BrokenPipeError, OSError) as e:
+                print(f"\n   [Error] FFmpeg pipe broken (likely encoder error): {e}")
+                cap.release()
+                pbar.close()
+                try:
+                    ffmpeg_process.stdin.close()
+                except Exception:
+                    pass
+                ffmpeg_process.wait()
+                return False
+
             frame_number += 1
             pbar.update(1)
-    
-    ffmpeg_process.stdin.close()
+
+    # Normal cleanup after successful loop
+    cap.release()
+    pbar.close()
+
+    try:
+        ffmpeg_process.stdin.close()
+    except Exception:
+        pass
     stderr_output = ffmpeg_process.stderr.read().decode()
     ffmpeg_process.wait()
-    cap.release()
 
     if ffmpeg_process.returncode != 0:
-        print("\n   ❌ FFmpeg frame processing failed.")
+        print("\n   [Error] FFmpeg frame processing failed.")
         print("   Stderr:", stderr_output)
         return False
 
-    print("\n   🔊 Step 5: Extracting audio...")
+    print("\n   [Step 5] Extracting audio...")
     audio_extract_command = [
         'ffmpeg', '-y', '-i', input_video, '-vn', '-acodec', 'copy', temp_audio_output
     ]
     try:
         subprocess.run(audio_extract_command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     except subprocess.CalledProcessError:
-        print("\n   ❌ Audio extraction failed (maybe no audio?). Proceeding without audio.")
+        print("\n   [Warning] Audio extraction failed. Proceeding without audio.")
         pass
 
-    print("\n   ✨ Step 6: Merging...")
+    print("\n   [Step 6] Merging...")
     if os.path.exists(temp_audio_output):
         merge_command = [
             'ffmpeg', '-y', '-i', temp_video_output, '-i', temp_audio_output,
@@ -738,9 +857,9 @@ def process_video_to_vertical(input_video, final_output_video):
         
     try:
         subprocess.run(merge_command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        print(f"   ✅ Clip saved to {final_output_video}")
+        print(f"   [OK] Clip saved")
     except subprocess.CalledProcessError as e:
-        print("\n   ❌ Final merge failed.")
+        print("\n   [Error] Final merge failed.")
         print("   Stderr:", e.stderr.decode())
         return False
 
@@ -751,11 +870,15 @@ def process_video_to_vertical(input_video, final_output_video):
     return True
 
 def transcribe_video(video_path):
-    print("🎙️  Transcribing video with Faster-Whisper (CPU Optimized)...")
+    print("[Transcribe] Starting Faster-Whisper (CPU Optimized)...")
     from faster_whisper import WhisperModel
-    
-    # Run on CPU with INT8 quantization for speed
-    model = WhisperModel("base", device="cpu", compute_type="int8")
+
+    # Cap CPU threads so long transcriptions (30+ min recordings) don't peg
+    # every core for hours and trigger thermal/power shutdowns. Slower but safe.
+    threads = max(2, (os.cpu_count() or 8) // 2)
+    print(f"[Transcribe] cpu_threads={threads}")
+    model = WhisperModel("base", device="cpu", compute_type="int8",
+                         cpu_threads=threads, num_workers=1)
     
     segments, info = model.transcribe(video_path, word_timestamps=True)
     
@@ -794,21 +917,20 @@ def transcribe_video(video_path):
         'language': info.language
     }
 
-def get_viral_clips(transcript_result, video_duration):
-    print("🤖  Analyzing with Gemini...")
-    
+def get_viral_clips(transcript_result, video_duration, num_clips=5):
+    print("[Gemini] Analyzing with Gemini...")
+
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        print("❌ Error: GEMINI_API_KEY not found in environment variables.")
+        print("[Error] GEMINI_API_KEY not found in environment variables.")
         return None
 
-
     client = genai.Client(api_key=api_key)
-    
+
     # We use gemini-2.5-flash as requested.
-    model_name = 'gemini-2.5-flash' 
-    
-    print(f"🤖  Initializing Gemini with model: {model_name}")
+    model_name = 'gemini-2.5-flash'
+
+    print(f"[Gemini] Initializing with model: {model_name} | Requested clips: {num_clips}")
 
     # Extract words
     words = []
@@ -823,7 +945,8 @@ def get_viral_clips(transcript_result, video_duration):
     prompt = GEMINI_PROMPT_TEMPLATE.format(
         video_duration=video_duration,
         transcript_text=json.dumps(transcript_result['text']),
-        words_json=json.dumps(words)
+        words_json=json.dumps(words),
+        num_clips=num_clips
     )
 
     try:
@@ -859,13 +982,13 @@ def get_viral_clips(transcript_result, video_duration):
                     "model": model_name
                 }
 
-                print(f"💰 Token Usage ({model_name}):")
+                print(f"[Tokens] Usage ({model_name}):")
                 print(f"   - Input Tokens: {prompt_tokens} (${input_cost:.6f})")
                 print(f"   - Output Tokens: {output_tokens} (${output_cost:.6f})")
                 print(f"   - Total Estimated Cost: ${total_cost:.6f}")
                 
         except Exception as e:
-            print(f"⚠️ Could not calculate cost: {e}")
+            print(f"[Warning] Could not calculate cost: {e}")
             cost_analysis = None
         # ------------------------
 
@@ -883,7 +1006,7 @@ def get_viral_clips(transcript_result, video_duration):
             
         return result_json
     except Exception as e:
-        print(f"❌ Gemini Error: {e}")
+        print(f"[Error] Gemini API failed: {e}")
         return None
 
 if __name__ == '__main__':
@@ -896,125 +1019,197 @@ if __name__ == '__main__':
     parser.add_argument('-o', '--output', type=str, help="Output directory or file (if processing whole video).")
     parser.add_argument('--keep-original', action='store_true', help="Keep the downloaded YouTube video.")
     parser.add_argument('--skip-analysis', action='store_true', help="Skip AI analysis and convert the whole video.")
-    
+    parser.add_argument('--clean-video', action='store_true', help="Remove filler words (uh, um, pauses) before generating clips.")
+    parser.add_argument('--single-reel', action='store_true', help="Create one polished reel from raw recording (removes filler/repeats, improves framing).")
+    parser.add_argument('--target-duration', type=int, default=60, help="Target duration for single reel in seconds (default: 60).")
+    parser.add_argument('--whisper-model', type=str, default='small', help="Whisper model size for transcription (tiny/base/small/medium/large).")
+    parser.add_argument('--whisper-language', type=str, default='auto', help="Language code for Whisper transcription (auto/en/bn/etc).")
+    parser.add_argument('--script-file', type=str, default=None, help="Optional path to a reference script (the speaker's intended script). Helps the AI match the actual transcript to what was meant to be said.")
+    parser.add_argument('--num-clips', type=int, default=5, help="Number of viral clips to generate (default: 5, max: 15).")
+
     args = parser.parse_args()
 
     script_start_time = time.time()
-    
-    def _ensure_dir(path: str) -> str:
-        """Create directory if missing and return the same path."""
-        if path:
-            os.makedirs(path, exist_ok=True)
-        return path
-    
-    # 1. Get Input Video
-    if args.url:
-        # For multi-clip runs, treat --output as an OUTPUT DIRECTORY (create it if needed).
-        # For whole-video runs (--skip-analysis), --output can be a file path.
-        if args.output and not args.skip_analysis:
-            output_dir = _ensure_dir(args.output)
-        else:
-            # If output is a directory, use it; if it's a filename, use its directory; else default "."
-            if args.output and os.path.isdir(args.output):
-                output_dir = args.output
-            elif args.output and not os.path.isdir(args.output):
-                output_dir = os.path.dirname(args.output) or "."
-            else:
-                output_dir = "."
-        
-        input_video, video_title = download_youtube_video(args.url, output_dir)
-    else:
-        input_video = args.input
-        video_title = os.path.splitext(os.path.basename(input_video))[0]
-        
-        if args.output and not args.skip_analysis:
-            # For multi-clip runs, treat --output as an OUTPUT DIRECTORY (create it if needed).
-            output_dir = _ensure_dir(args.output)
-        else:
-            # If output is a directory, use it; if it's a filename, use its directory; else default to input dir.
-            if args.output and os.path.isdir(args.output):
-                output_dir = args.output
-            elif args.output and not os.path.isdir(args.output):
-                output_dir = os.path.dirname(args.output) or os.path.dirname(input_video)
-            else:
-                output_dir = os.path.dirname(input_video)
 
-    if not os.path.exists(input_video):
-        print(f"❌ Input file not found: {input_video}")
+    try:
+        def _ensure_dir(path: str) -> str:
+            """Create directory if missing and return the same path."""
+            if path:
+                os.makedirs(path, exist_ok=True)
+            return path
+
+        # 1. Get Input Video
+        if args.url:
+            # For multi-clip runs, treat --output as an OUTPUT DIRECTORY (create it if needed).
+            # For whole-video runs (--skip-analysis), --output can be a file path.
+            if args.output and not args.skip_analysis:
+                output_dir = _ensure_dir(args.output)
+            else:
+                # If output is a directory, use it; if it's a filename, use its directory; else default "."
+                if args.output and os.path.isdir(args.output):
+                    output_dir = args.output
+                elif args.output and not os.path.isdir(args.output):
+                    output_dir = os.path.dirname(args.output) or "."
+                else:
+                    output_dir = "."
+
+            input_video, video_title = download_youtube_video(args.url, output_dir)
+        else:
+            input_video = args.input
+            video_title = os.path.splitext(os.path.basename(input_video))[0]
+
+            if args.output and not args.skip_analysis:
+                # For multi-clip runs, treat --output as an OUTPUT DIRECTORY (create it if needed).
+                output_dir = _ensure_dir(args.output)
+            else:
+                # If output is a directory, use it; if it's a filename, use its directory; else default to input dir.
+                if args.output and os.path.isdir(args.output):
+                    output_dir = args.output
+                elif args.output and not os.path.isdir(args.output):
+                    output_dir = os.path.dirname(args.output) or os.path.dirname(input_video)
+                else:
+                    output_dir = os.path.dirname(input_video)
+
+        if not os.path.exists(input_video):
+            print(f"[Error] Input file not found: {input_video}")
+            exit(1)
+
+        # 2. Mode selection: Single Reel, Clean Video, or Clip Generation
+        if args.single_reel:
+            print("\n[Reel Mode] Creating single polished reel from raw recording...")
+            if args.output and os.path.isdir(args.output):
+                output_file = os.path.join(args.output, f"{video_title}_reel.mp4")
+            elif args.output:
+                output_file = args.output
+            else:
+                output_file = os.path.join(output_dir, f"{video_title}_reel.mp4")
+
+            # Optional reference script
+            reference_script = None
+            if args.script_file and os.path.exists(args.script_file):
+                try:
+                    with open(args.script_file, 'r', encoding='utf-8') as sf:
+                        reference_script = sf.read().strip()
+                    print(f"[Reel] Reference script loaded ({len(reference_script)} chars)")
+                except Exception as e:
+                    print(f"[Reel] Could not read reference script: {e}")
+
+            from video_cleaner import create_single_reel as create_reel_func
+            result = create_reel_func(
+                input_video,
+                output_path=output_file,
+                model_size=args.whisper_model,
+                language=args.whisper_language,
+                target_duration=args.target_duration if args.target_duration else None,
+                improve_framing=True,
+                reference_script=reference_script
+            )
+            if result:
+                print(f"[Reel Mode] Complete! Output: {result}")
+            else:
+                print("[Reel Mode] Failed to create reel")
+            exit(0 if result else 1)
+
+        # Clean video mode (preprocessing for clip generation)
+        working_video = input_video
+        if args.clean_video:
+            print("\n[Cleaner] Removing filler words and pauses...")
+            cleaned_path = clean_video_filler_words(
+                input_video,
+                model_size=args.whisper_model,
+                language=args.whisper_language
+            )
+            if cleaned_path:
+                print(f"[Cleaner] Using cleaned video: {cleaned_path}")
+                working_video = cleaned_path
+            else:
+                print("[Cleaner] Warning: Cleaning failed, using original video")
+
+        # 3. Decision: Analyze clips or process whole?
+        if args.skip_analysis:
+            print("[Info] Skipping analysis, processing entire video...")
+            output_file = args.output if args.output else os.path.join(output_dir, f"{video_title}_vertical.mp4")
+            process_video_to_vertical(working_video, output_file)
+        else:
+            # 3. Transcribe
+            transcript = transcribe_video(working_video)
+
+            # Get duration
+            cap = cv2.VideoCapture(working_video)
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if fps <= 0:
+                fps = 30.0
+                print(f"   [Warning] Invalid FPS in duration calc, defaulting to {fps}")
+            duration = frame_count / fps
+            cap.release()
+
+            # 4. Gemini Analysis
+            clips_data = get_viral_clips(transcript, duration, num_clips=args.num_clips)
+
+            if not clips_data or 'shorts' not in clips_data:
+                print("[Error] Failed to identify clips. Converting whole video as fallback.")
+                output_file = os.path.join(output_dir, f"{video_title}_vertical.mp4")
+                process_video_to_vertical(working_video, output_file)
+            else:
+                print(f"[OK] Found {len(clips_data['shorts'])} viral clips!")
+
+                # Save metadata
+                clips_data['transcript'] = transcript # Save full transcript for subtitles
+                metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
+                with open(metadata_file, 'w') as f:
+                    json.dump(clips_data, f, indent=2)
+                print(f"   Saved metadata to {metadata_file}")
+
+                # 5. Process each clip
+                for i, clip in enumerate(clips_data['shorts']):
+                    start = clip['start']
+                    end = clip['end']
+                    print(f"\n[Process] Processing Clip {i+1}: {start}s - {end}s")
+                    print(f"   Title: {clip.get('video_title_for_youtube_short', 'No Title')}")
+
+                    # Cut clip
+                    clip_filename = f"{video_title}_clip_{i+1}.mp4"
+                    clip_temp_path = os.path.join(output_dir, f"temp_{clip_filename}")
+                    clip_final_path = os.path.join(output_dir, clip_filename)
+
+                    # ffmpeg cut
+                    # Using re-encoding for precision as requested by strict seconds.
+                    # scale caps 4K+ camera footage at 1080p-class so the tracking
+                    # pipeline never decodes oversized frames (no-op for <=1080p);
+                    # format normalizes 10-bit 4:2:2 camera footage to standard 8-bit.
+                    cut_command = [
+                        'ffmpeg', '-y',
+                        '-ss', str(start),
+                        '-to', str(end),
+                        '-i', working_video,
+                        '-vf', 'scale=-2:min(1920\\,ih),format=yuv420p',
+                        '-c:v', 'libx264', '-crf', '18', '-preset', 'fast',
+                        '-c:a', 'aac',
+                        clip_temp_path
+                    ]
+                    subprocess.run(cut_command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+                    # Process vertical
+                    success = process_video_to_vertical(clip_temp_path, clip_final_path)
+
+                    if success:
+                        print(f"   [OK] Clip {i+1} ready")
+
+                    # Clean up temp cut
+                    if os.path.exists(clip_temp_path):
+                        os.remove(clip_temp_path)
+
+        # Clean up original if requested
+        if args.url and not args.keep_original and os.path.exists(input_video):
+            os.remove(input_video)
+            print("[Cleanup] Removed downloaded video.")
+
+    except Exception as e:
+        import traceback
+        print(f"\n[Fatal Error] Unexpected crash during processing: {e}")
+        traceback.print_exc()
         exit(1)
 
-    # 2. Decision: Analyze clips or process whole?
-    if args.skip_analysis:
-        print("⏩ Skipping analysis, processing entire video...")
-        output_file = args.output if args.output else os.path.join(output_dir, f"{video_title}_vertical.mp4")
-        process_video_to_vertical(input_video, output_file)
-    else:
-        # 3. Transcribe
-        transcript = transcribe_video(input_video)
-        
-        # Get duration
-        cap = cv2.VideoCapture(input_video)
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        duration = frame_count / fps
-        cap.release()
-
-        # 4. Gemini Analysis
-        clips_data = get_viral_clips(transcript, duration)
-        
-        if not clips_data or 'shorts' not in clips_data:
-            print("❌ Failed to identify clips. Converting whole video as fallback.")
-            output_file = os.path.join(output_dir, f"{video_title}_vertical.mp4")
-            process_video_to_vertical(input_video, output_file)
-        else:
-            print(f"🔥 Found {len(clips_data['shorts'])} viral clips!")
-            
-            # Save metadata
-            clips_data['transcript'] = transcript # Save full transcript for subtitles
-            metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
-            with open(metadata_file, 'w') as f:
-                json.dump(clips_data, f, indent=2)
-            print(f"   Saved metadata to {metadata_file}")
-
-            # 5. Process each clip
-            for i, clip in enumerate(clips_data['shorts']):
-                start = clip['start']
-                end = clip['end']
-                print(f"\n🎬 Processing Clip {i+1}: {start}s - {end}s")
-                print(f"   Title: {clip.get('video_title_for_youtube_short', 'No Title')}")
-                
-                # Cut clip
-                clip_filename = f"{video_title}_clip_{i+1}.mp4"
-                clip_temp_path = os.path.join(output_dir, f"temp_{clip_filename}")
-                clip_final_path = os.path.join(output_dir, clip_filename)
-                
-                # ffmpeg cut
-                # Using re-encoding for precision as requested by strict seconds
-                cut_command = [
-                    'ffmpeg', '-y', 
-                    '-ss', str(start), 
-                    '-to', str(end), 
-                    '-i', input_video,
-                    '-c:v', 'libx264', '-crf', '18', '-preset', 'fast',
-                    '-c:a', 'aac',
-                    clip_temp_path
-                ]
-                subprocess.run(cut_command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                
-                # Process vertical
-                success = process_video_to_vertical(clip_temp_path, clip_final_path)
-                
-                if success:
-                    print(f"   ✅ Clip {i+1} ready: {clip_final_path}")
-                
-                # Clean up temp cut
-                if os.path.exists(clip_temp_path):
-                    os.remove(clip_temp_path)
-
-    # Clean up original if requested
-    if args.url and not args.keep_original and os.path.exists(input_video):
-        os.remove(input_video)
-        print(f"🗑️  Cleaned up downloaded video.")
-
     total_time = time.time() - script_start_time
-    print(f"\n⏱️  Total execution time: {total_time:.2f}s")
+    print(f"\n[Timing] Total execution time: {total_time:.2f}s")

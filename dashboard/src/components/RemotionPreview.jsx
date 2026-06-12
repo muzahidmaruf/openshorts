@@ -25,9 +25,16 @@ export default function RemotionPreview({
     const fps = 30;
     const durationInFrames = Math.max(1, Math.round(durationInSeconds * fps));
 
+    // Ensure absolute URL pointing directly at the backend (bypass Vite proxy)
+    const baseUrl = import.meta.env.VITE_API_URL || `http://${window.location.hostname}:8000`;
+    const absoluteVideoUrl = videoUrl.startsWith('http')
+        ? videoUrl
+        : `${baseUrl}${videoUrl}`;
+    console.log('[RemotionPreview] videoUrl:', videoUrl, 'absolute:', absoluteVideoUrl);
+
     const inputProps = useMemo(
         () => ({
-            videoUrl,
+            videoUrl: absoluteVideoUrl,
             durationInFrames,
             fps,
             width: 1080,
@@ -36,7 +43,7 @@ export default function RemotionPreview({
             hook,
             effects,
         }),
-        [videoUrl, durationInFrames, subtitles, hook, effects]
+        [absoluteVideoUrl, durationInFrames, subtitles, hook, effects]
     );
 
     return (

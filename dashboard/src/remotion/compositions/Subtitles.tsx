@@ -21,9 +21,49 @@ const POSITION_MAP: Record<string, React.CSSProperties> = {
   bottom: { bottom: "10%", top: "auto" },
 };
 
+// Detect "loud" words (ALL CAPS, numbers, or punctuation hits)
+const isLoudWord = (text: string) => {
+  if (!text) return false;
+  const t = text.trim();
+  if (/[!?]$/.test(t)) return true;
+  if (/\d/.test(t)) return true;
+  const letters = t.replace(/[^A-Za-z]/g, "");
+  if (letters.length >= 3 && letters === letters.toUpperCase()) return true;
+  return false;
+};
+
+// Build the outline for the chosen stroke. Returns "" when the stroke is
+// off (width <= 0) — nothing is forced, so "no stroke" really means none.
+const buildTextShadow = (borderWidth: number, borderColor: string) => {
+  if (borderWidth <= 0) {
+    return "";
+  }
+  const w = borderWidth;
+  const layers: string[] = [
+    `${w}px 0 0 ${borderColor}`,
+    `-${w}px 0 0 ${borderColor}`,
+    `0 ${w}px 0 ${borderColor}`,
+    `0 -${w}px 0 ${borderColor}`,
+    `${w}px ${w}px 0 ${borderColor}`,
+    `-${w}px -${w}px 0 ${borderColor}`,
+    `${w}px -${w}px 0 ${borderColor}`,
+    `-${w}px ${w}px 0 ${borderColor}`,
+  ];
+  return layers.join(", ");
+};
+
+// Compose shadow layers, dropping empty ones (e.g. stroke off).
+const joinShadows = (...parts: (string | undefined | false)[]) =>
+  parts.filter(Boolean).join(", ") || "none";
+
 export const Subtitles: React.FC<SubtitlesProps> = ({ config }) => {
   const { fps } = useVideoConfig();
-  const blocks = groupCaptionsIntoBlocks(config.captions);
+  const blocks = groupCaptionsIntoBlocks(
+    config.captions,
+    20,
+    2000,
+    config.wordsPerLine
+  );
 
   return (
     <AbsoluteFill>
@@ -72,8 +112,22 @@ const SubtitleBlock: React.FC<SubtitleBlockProps> = ({
   const currentTimeMs = blockStartMs + (frame / fps) * 1000;
   const activeIndex = getActiveWordIndex(block.words, currentTimeMs);
 
-  const positionStyle = POSITION_MAP[position] ?? POSITION_MAP.bottom;
+  // Free-form drag position takes precedence over the top/middle/bottom preset.
+  const hasFreePos =
+    typeof config.posX === "number" && typeof config.posY === "number";
+  const positionStyle: React.CSSProperties = hasFreePos
+    ? {
+        left: `${config.posX}%`,
+        top: `${config.posY}%`,
+        right: "auto",
+        bottom: "auto",
+        transform: "translate(-50%, -50%)",
+      }
+    : POSITION_MAP[position] ?? POSITION_MAP.bottom;
   const fontStack = getFontStack(style.fontFamily);
+  const highlightFontStack = style.highlightFontFamily
+    ? getFontStack(style.highlightFontFamily)
+    : fontStack;
 
   // Background box style
   const hasBg = style.bgOpacity > 0;
@@ -103,8 +157,20 @@ const SubtitleBlock: React.FC<SubtitleBlockProps> = ({
           display: "flex",
           flexWrap: "wrap",
           justifyContent: "center",
-          gap: "6px 8px",
-          maxWidth: "85%",
+          alignItems: "center",
+          maxWidth: "92%",
+          // Hormozi / Stack styles force one word per line so the active
+          // keyword pops as a giant centered word (see the Reels mock-ups).
+          flexDirection:
+            style.animation === "hormozi" || style.animation === "stack"
+              ? "column"
+              : "row",
+          gap:
+            style.animation === "hormozi"
+              ? "0.05em"
+              : style.animation === "stack"
+              ? "0.02em"
+              : 0,
           ...bgStyle,
         }}
       >
@@ -113,8 +179,11 @@ const SubtitleBlock: React.FC<SubtitleBlockProps> = ({
             key={i}
             word={word.text}
             isActive={i === activeIndex}
+            wordIndex={i}
+            totalWords={block.words.length}
             style={style}
             fontStack={fontStack}
+            highlightFontStack={highlightFontStack}
             animation={style.animation}
             frame={frame}
             fps={fps}
@@ -130,8 +199,11 @@ const SubtitleBlock: React.FC<SubtitleBlockProps> = ({
 interface WordSpanProps {
   word: string;
   isActive: boolean;
+  wordIndex: number;
+  totalWords: number;
   style: SubtitleConfig["style"];
   fontStack: string;
+  highlightFontStack?: string;
   animation: SubtitleConfig["style"]["animation"];
   frame: number;
   fps: number;
@@ -142,8 +214,11 @@ interface WordSpanProps {
 const WordSpan: React.FC<WordSpanProps> = ({
   word,
   isActive,
+  wordIndex,
+  totalWords,
   style,
   fontStack,
+  highlightFontStack,
   animation,
   frame,
   fps,
@@ -155,22 +230,73 @@ const WordSpan: React.FC<WordSpanProps> = ({
   );
 
   let transform = "";
-  let color = style.fontColor;
+  let color = isActive ? style.highlightColor : style.fontColor;
   let extraStyle: React.CSSProperties = {};
+  let textShadowOverride: string | undefined;
+  let fontSizeOverride: number | undefined;
+
+  // The user-controlled stroke ("" when turned off). Reused by every
+  // animation so "no stroke" stays no stroke even on the active word.
+  const strokeShadow = buildTextShadow(style.borderWidth, style.borderColor);
+
+  // Emphasis animation: detect loud words and give them extra pop
+  const loud = isLoudWord(word);
 
   if (isActive) {
-    color = style.highlightColor;
-
     switch (animation) {
       case "pop": {
-        const scale = spring({
+        const s = spring({
           frame: frame - wordStartFrame,
           fps,
           config: { mass: 0.5, stiffness: 300, damping: 12 },
           durationInFrames: 10,
         });
-        const scaleValue = interpolate(scale, [0, 1], [1, 1.25]);
+        const scaleValue = interpolate(s, [0, 1], [1, 1.25]);
         transform = `scale(${scaleValue})`;
+        break;
+      }
+      case "bounce": {
+        const delta = frame - wordStartFrame;
+        const activeWindow = Math.round(0.22 * fps);
+        const t = Math.min(1, Math.max(0, delta / activeWindow));
+        const ease = 1 - Math.pow(1 - t, 3);
+        const y = -12 * (1 - ease);
+        const scaleValue = 1 + t * 0.08;
+        transform = `translateY(${y}px) scale(${scaleValue})`;
+        break;
+      }
+      case "fadeup": {
+        const delta = frame - wordStartFrame;
+        const dur = Math.round(0.18 * fps);
+        const t = Math.min(1, Math.max(0, delta / dur));
+        const ease = 1 - Math.pow(1 - t, 2);
+        const y = (1 - ease) * 16;
+        const opacity = delta < 0 ? 0 : ease;
+        extraStyle = { opacity };
+        transform = `translateY(${y}px) scale(${isActive ? 1.06 : 1})`;
+        break;
+      }
+      case "emphasis": {
+        if (loud) {
+          const s = spring({
+            frame: frame - wordStartFrame,
+            fps,
+            config: { mass: 0.6, stiffness: 280, damping: 10 },
+            durationInFrames: 12,
+          });
+          const scaleValue = interpolate(s, [0, 1], [1, 1.35]);
+          transform = `scale(${scaleValue}) translateY(-4px)`;
+          textShadowOverride = joinShadows(`0 0 10px ${style.highlightColor}`, `0 0 20px ${style.highlightColor}aa`, strokeShadow);
+        } else {
+          const s = spring({
+            frame: frame - wordStartFrame,
+            fps,
+            config: { mass: 0.5, stiffness: 300, damping: 12 },
+            durationInFrames: 10,
+          });
+          const scaleValue = interpolate(s, [0, 1], [1, 1.12]);
+          transform = `scale(${scaleValue})`;
+        }
         break;
       }
       case "karaoke": {
@@ -188,36 +314,104 @@ const WordSpan: React.FC<WordSpanProps> = ({
         };
         break;
       }
+      case "hormozi": {
+        // Hormozi/Reels viral style: spoken word grows MUCH larger, glows
+        // yellow, and (because the parent flex container switches to column
+        // for this mode) takes its own row.
+        const delta = frame - wordStartFrame;
+        const popWindow = Math.round(0.18 * fps);
+        const t = Math.min(1, Math.max(0, delta / popWindow));
+        const ease = 1 - Math.pow(1 - t, 3);
+        const scaleValue = 1 + ease * 0.05;
+        transform = `scale(${scaleValue})`;
+        fontSizeOverride = style.fontSize * 2.3;
+        textShadowOverride = joinShadows(
+          `0 0 14px ${style.highlightColor}`,
+          `0 0 28px ${style.highlightColor}cc`,
+          `0 0 42px ${style.highlightColor}80`,
+          strokeShadow
+        );
+        break;
+      }
+      case "stack": {
+        // Word Stack: each spoken word pops in big white with a soft glow,
+        // mimicking the magazine-layout look from the "Your feed looks
+        // 5 different people" mock-up. Lower-key than Hormozi.
+        const delta = frame - wordStartFrame;
+        const popWindow = Math.round(0.14 * fps);
+        const t = Math.min(1, Math.max(0, delta / popWindow));
+        const ease = 1 - Math.pow(1 - t, 2);
+        const opacity = Math.min(1, t * 2);
+        const scaleValue = 0.85 + ease * 0.2;
+        transform = `scale(${scaleValue})`;
+        extraStyle = { opacity };
+        fontSizeOverride = style.fontSize * 1.9;
+        color = style.fontColor;
+        textShadowOverride = joinShadows(strokeShadow, "0 6px 18px rgba(0,0,0,0.55)");
+        break;
+      }
       default:
         break;
     }
   }
 
-  // Text stroke via textShadow (CSS paint-order not reliable in Remotion)
-  const strokeShadow =
-    style.borderWidth > 0
-      ? [
-          `${style.borderWidth}px 0 0 ${style.borderColor}`,
-          `-${style.borderWidth}px 0 0 ${style.borderColor}`,
-          `0 ${style.borderWidth}px 0 ${style.borderColor}`,
-          `0 -${style.borderWidth}px 0 ${style.borderColor}`,
-        ].join(", ")
-      : "none";
+  // Hormozi: words that aren't the active focus shrink and fade so the
+  // spoken word visually dominates (matches the "how do you HOOK somebody"
+  // composition).
+  if (animation === "hormozi" && !isActive) {
+    fontSizeOverride = style.fontSize * 0.85;
+    extraStyle = { ...extraStyle, opacity: 0.85 };
+    color = style.fontColor;
+  }
+
+  // Stack: inactive words are dim and slightly smaller — the focal word
+  // pops alone in the centre of the stack.
+  if (animation === "stack" && !isActive) {
+    fontSizeOverride = style.fontSize * 0.75;
+    extraStyle = { ...extraStyle, opacity: 0.45 };
+    color = style.fontColor;
+  }
+
+  // Text stroke via textShadow (CSS paint-order not reliable in Remotion).
+  // strokeShadow is "" when the user turned the stroke off, so nothing is drawn.
+  const finalTextShadow = textShadowOverride
+    ? textShadowOverride
+    : animation !== "karaoke"
+    ? joinShadows(strokeShadow, extraStyle.textShadow as string)
+    : strokeShadow || "none";
+
+  // Force-uppercase for Hormozi-style is overkill — those reels typically
+  // keep natural casing on context words and only loud-emphasis the focal
+  // word. We leave casing alone unless the user chose "emphasis".
+  const isViralActive =
+    isActive && (animation === "hormozi" || animation === "stack");
 
   return (
     <span
       style={{
-        fontFamily: fontStack,
-        fontSize: style.fontSize,
-        fontWeight: 700,
+        fontFamily: isViralActive && highlightFontStack
+          ? highlightFontStack
+          : isActive && highlightFontStack
+          ? highlightFontStack
+          : fontStack,
+        fontSize: fontSizeOverride ?? style.fontSize,
+        fontWeight: isViralActive ? 900 : 800,
+        lineHeight: animation === "hormozi" || animation === "stack" ? 0.95 : 1.15,
         color: animation === "karaoke" && isActive ? undefined : color,
-        textShadow:
-          animation !== "karaoke"
-            ? [strokeShadow, extraStyle.textShadow].filter(Boolean).join(", ")
-            : strokeShadow,
+        textShadow: finalTextShadow,
         transform,
+        transformOrigin: "center center",
         display: "inline-block",
         transition: "none",
+        marginRight: animation === "hormozi" || animation === "stack" ? 0 : "0.35em",
+        marginBottom: animation === "hormozi" || animation === "stack" ? 0 : "0.12em",
+        textTransform: animation === "emphasis" ? "uppercase" : undefined,
+        letterSpacing:
+          animation === "emphasis"
+            ? "0.01em"
+            : animation === "hormozi"
+            ? "-0.01em"
+            : undefined,
         ...extraStyle,
       }}
     >

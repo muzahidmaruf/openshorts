@@ -1,4 +1,5 @@
 import os
+import sys
 import uuid
 import subprocess
 import threading
@@ -13,7 +14,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, FileResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
 
@@ -28,7 +30,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # Configuration
 # Default to 1 if not set, but user can set higher for powerful servers
 MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "5"))
-MAX_FILE_SIZE_MB = 2048  # 2GB limit
+MAX_FILE_SIZE_MB = 8192  # 8GB limit (raw camera footage can be very large)
 JOB_RETENTION_SECONDS = 3600  # 1 hour retention
 
 # Application State
@@ -83,7 +85,7 @@ def _relocate_root_job_artifacts(job_id: str, job_output_dir: str) -> bool:
 async def cleanup_jobs():
     """Background task to remove old jobs and files."""
     import time
-    print("🧹 Cleanup task started.")
+    print("[Cleanup] Task started.")
     while True:
         try:
             await asyncio.sleep(300) # Check every 5 minutes
@@ -95,7 +97,7 @@ async def cleanup_jobs():
                 job_path = os.path.join(OUTPUT_DIR, job_id)
                 if os.path.isdir(job_path):
                     if now - os.path.getmtime(job_path) > JOB_RETENTION_SECONDS:
-                        print(f"🧹 Purging old job: {job_id}")
+                        print(f"[Cleanup] Purging old job: {job_id}")
                         shutil.rmtree(job_path, ignore_errors=True)
                         if job_id in jobs:
                             del jobs[job_id]
@@ -123,11 +125,11 @@ async def cleanup_jobs():
                 except Exception: pass
 
         except Exception as e:
-            print(f"⚠️ Cleanup error: {e}")
+            print(f"[Cleanup] Error: {e}")
 
 async def process_queue():
     """Background worker to process jobs from the queue with concurrency limit."""
-    print(f"🚀 Job Queue Worker started with {MAX_CONCURRENT_JOBS} concurrent slots.")
+    print(f"[Queue] Worker started with {MAX_CONCURRENT_JOBS} concurrent slots.")
     while True:
         try:
             # Wait for a job
@@ -135,13 +137,13 @@ async def process_queue():
             
             # Acquire semaphore slot (waits if max jobs are running)
             await concurrency_semaphore.acquire()
-            print(f"🔄 Acquired slot for job: {job_id}")
+            print(f"[Queue] Acquired slot for job: {job_id}")
 
             # Process in background task to not block the loop (allowing other slots to fill)
             asyncio.create_task(run_job_wrapper(job_id))
             
         except Exception as e:
-            print(f"❌ Queue dispatch error: {e}")
+            print(f"[Queue] Error: {e}")
             await asyncio.sleep(1)
 
 async def run_job_wrapper(job_id):
@@ -151,12 +153,12 @@ async def run_job_wrapper(job_id):
         if job:
             await run_job(job_id, job)
     except Exception as e:
-         print(f"❌ Job wrapper error {job_id}: {e}")
+         print(f"[Job] Error {job_id}: {e}")
     finally:
         # Always release semaphore and mark queue task done
         concurrency_semaphore.release()
         job_queue.task_done()
-        print(f"✅ Released slot for job: {job_id}")
+        print(f"[Job] Released slot for job: {job_id}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -177,6 +179,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Custom middleware to add CORS headers to static files (CORSMiddleware doesn't cover StaticFiles mounts)
+class StaticFilesCORSMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        # Add CORS headers for video/thumbnail assets requested cross-origin
+        if request.url.path.startswith(("/videos/", "/thumbnails/", "/gallery/")):
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            response.headers["Access-Control-Allow-Methods"] = "GET, HEAD, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = "*"
+        return response
+
+app.add_middleware(StaticFilesCORSMiddleware)
+
 # Mount static files for serving videos
 app.mount("/videos", StaticFiles(directory=OUTPUT_DIR), name="videos")
 
@@ -188,19 +203,83 @@ app.mount("/thumbnails", StaticFiles(directory=THUMBNAILS_DIR), name="thumbnails
 class ProcessRequest(BaseModel):
     url: str
 
-def enqueue_output(out, job_id):
-    """Reads output from a subprocess and appends it to jobs logs."""
+def _safe_console_print(msg):
+    """
+    Print to the backend console without ever raising.
+
+    On Windows the default console encoding is cp1252, which cannot encode
+    characters like 'é' or curly quotes. A naked print() of a subprocess line
+    that contains those characters raises UnicodeEncodeError. If that
+    exception bubbles up inside enqueue_output, the subprocess stdout pipe
+    gets closed, the subprocess gets a broken-pipe error on its next write,
+    and dies with exit code 1 — even though nothing about the actual job
+    failed. Always sanitize for the host console.
+    """
     try:
+        enc = (sys.stdout.encoding or 'utf-8')
+        # Re-encode with replacement so unsupported chars become '?' instead of crashing.
+        safe = msg.encode(enc, errors='replace').decode(enc, errors='replace')
+        print(safe)
+    except Exception:
+        # Last-resort fallback — never propagate logging errors.
+        try:
+            sys.stdout.write(repr(msg) + "\n")
+        except Exception:
+            pass
+
+
+def enqueue_output(out, job_id):
+    """Reads output from a subprocess, appends to in-memory logs, AND persists to disk."""
+    log_file = None
+    try:
+        # Persist a per-job log file so post-mortem debugging is possible.
+        try:
+            job_out_dir = jobs.get(job_id, {}).get('output_dir')
+            if job_out_dir:
+                os.makedirs(job_out_dir, exist_ok=True)
+                log_path = os.path.join(job_out_dir, 'job.log')
+                log_file = open(log_path, 'a', encoding='utf-8')
+        except Exception as e:
+            _safe_console_print(f"[Job {job_id}] Could not open log file: {e}")
+            log_file = None
+
         for line in iter(out.readline, b''):
-            decoded_line = line.decode('utf-8').strip()
-            if decoded_line:
-                print(f"📝 [Job Output] {decoded_line}")
+            try:
+                decoded_line = line.decode('utf-8', errors='replace').rstrip()
+            except Exception:
+                continue
+            if not decoded_line:
+                continue
+
+            # 1. Mirror to backend console (must NEVER raise — see _safe_console_print)
+            _safe_console_print(f"[Job Output] {decoded_line}")
+
+            # 2. Append to in-memory log buffer
+            try:
                 if job_id in jobs:
                     jobs[job_id]['logs'].append(decoded_line)
+            except Exception:
+                pass
+
+            # 3. Persist to disk
+            if log_file is not None:
+                try:
+                    log_file.write(decoded_line + "\n")
+                    log_file.flush()
+                except Exception:
+                    pass
     except Exception as e:
-        print(f"Error reading output for job {job_id}: {e}")
+        _safe_console_print(f"Error reading output for job {job_id}: {e}")
     finally:
-        out.close()
+        try:
+            out.close()
+        except Exception:
+            pass
+        if log_file is not None:
+            try:
+                log_file.close()
+            except Exception:
+                pass
 
 async def run_job(job_id, job_data):
     """Executes the subprocess for a specific job."""
@@ -211,7 +290,7 @@ async def run_job(job_id, job_data):
     
     jobs[job_id]['status'] = 'processing'
     jobs[job_id]['logs'].append("Job started by worker.")
-    print(f"🎬 [run_job] Executing command for {job_id}: {' '.join(cmd)}")
+    print(f"[run_job] Executing command for {job_id}: {' '.join(cmd)}")
     
     try:
         process = subprocess.Popen(
@@ -267,39 +346,129 @@ async def run_job(job_id, job_data):
                 pass
 
         returncode = process.returncode
-        
+
+        # Drain remaining stdout/stderr from the log thread before deciding success/failure.
+        # Otherwise the trailing traceback that explains a non-zero exit can arrive
+        # AFTER the "Process failed" line — or be missed entirely.
+        try:
+            t_log.join(timeout=10)
+        except Exception:
+            pass
+
         if returncode == 0:
-            jobs[job_id]['status'] = 'completed'
             jobs[job_id]['logs'].append("Process finished successfully.")
-            
+
             # Start S3 upload in background (silent, non-blocking)
             loop = asyncio.get_event_loop()
             loop.run_in_executor(None, upload_job_artifacts, output_dir, job_id)
-            
-            # Find result JSON
-            json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
-            if not json_files:
-                # Backward-compat rescue if outputs were written to OUTPUT_DIR root
-                if _relocate_root_job_artifacts(job_id, output_dir):
-                    json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
-            if json_files:
-                target_json = json_files[0] 
-                with open(target_json, 'r') as f:
-                    data = json.load(f)
-                
-                # Enhance result with video URLs
-                base_name = os.path.basename(target_json).replace('_metadata.json', '')
-                clips = data.get('shorts', [])
-                cost_analysis = data.get('cost_analysis')
 
-                for i, clip in enumerate(clips):
-                     clip_filename = f"{base_name}_clip_{i+1}.mp4"
-                     clip['video_url'] = f"/videos/{job_id}/{clip_filename}"
-                
-                jobs[job_id]['result'] = {'clips': clips, 'cost_analysis': cost_analysis}
+            # NOTE: do NOT mark the job 'completed' yet — if single-reel mode
+            # ran, we still need to transcribe the reel for in-app editing,
+            # which takes 30+ seconds. The frontend stops polling when status
+            # flips to 'completed', so flipping it now means the post-reel
+            # 'clips' array never reaches the UI.
+            # We keep status as 'processing' and only mark complete once the
+            # final result (with clips, if applicable) is in place.
+
+            # Check if single reel mode was used (look for *_reel.mp4 file)
+            reel_files = glob.glob(os.path.join(output_dir, "*_reel.mp4"))
+            if reel_files:
+                # Single reel mode - return the single video URL.
+                # Also transcribe the final reel + write metadata.json so the
+                # subtitle/hook/edit/translate endpoints (which key off metadata
+                # + clip_index) work identically to multi-clip mode.
+                reel_path = reel_files[0]
+                reel_filename = os.path.basename(reel_path)
+                reel_video_url = f"/videos/{job_id}/{reel_filename}"
+                jobs[job_id]['logs'].append(f"Single reel created: {reel_filename}")
+
+                # Result fallback in case post-processing fails — at minimum the
+                # user still gets the player and download.
+                jobs[job_id]['result'] = {
+                    'single_reel': True,
+                    'video_url': reel_video_url,
+                }
+
+                try:
+                    jobs[job_id]['logs'].append("Transcribing reel for in-app editing...")
+                    from main import transcribe_video as _transcribe_video
+
+                    loop_inner = asyncio.get_event_loop()
+                    transcript = await loop_inner.run_in_executor(
+                        None, _transcribe_video, reel_path
+                    )
+
+                    # Duration via ffprobe (lightweight)
+                    try:
+                        probe_out = subprocess.check_output([
+                            'ffprobe', '-v', 'error',
+                            '-show_entries', 'format=duration',
+                            '-of', 'default=noprint_wrappers=1:nokey=1',
+                            reel_path
+                        ]).decode().strip()
+                        duration = float(probe_out)
+                    except Exception:
+                        duration = 0.0
+
+                    base_name = os.path.splitext(reel_filename)[0]
+                    clip_entry = {
+                        'start': 0.0,
+                        'end': duration,
+                        'video_title_for_youtube_short': 'Polished Reel',
+                        'video_description_for_tiktok': '',
+                        'video_description_for_instagram': '',
+                        'viral_hook_text': '',
+                        'video_url': reel_video_url,
+                    }
+                    metadata = {
+                        'transcript': transcript,
+                        'shorts': [clip_entry],
+                    }
+                    metadata_path = os.path.join(output_dir, f"{base_name}_metadata.json")
+                    with open(metadata_path, 'w', encoding='utf-8') as mf:
+                        json.dump(metadata, mf, indent=2)
+
+                    jobs[job_id]['result'] = {
+                        'single_reel': True,
+                        'video_url': reel_video_url,  # backward compat
+                        'clips': [clip_entry],
+                    }
+                    jobs[job_id]['logs'].append("Transcript ready — subtitles & edits enabled")
+                except Exception as e:
+                    jobs[job_id]['logs'].append(
+                        f"Reel post-process failed: {e} — basic playback only"
+                    )
             else:
-                 jobs[job_id]['status'] = 'failed'
-                 jobs[job_id]['logs'].append("No metadata file generated.")
+                # Multi-clip mode - look for metadata.json
+                json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+                if not json_files:
+                    # Backward-compat rescue if outputs were written to OUTPUT_DIR root
+                    if _relocate_root_job_artifacts(job_id, output_dir):
+                        json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+                if json_files:
+                    target_json = json_files[0]
+                    with open(target_json, 'r') as f:
+                        data = json.load(f)
+
+                    # Enhance result with video URLs
+                    base_name = os.path.basename(target_json).replace('_metadata.json', '')
+                    clips = data.get('shorts', [])
+                    cost_analysis = data.get('cost_analysis')
+
+                    for i, clip in enumerate(clips):
+                         clip_filename = f"{base_name}_clip_{i+1}.mp4"
+                         clip['video_url'] = f"/videos/{job_id}/{clip_filename}"
+
+                    jobs[job_id]['result'] = {'clips': clips, 'cost_analysis': cost_analysis}
+                else:
+                     jobs[job_id]['status'] = 'failed'
+                     jobs[job_id]['logs'].append("No metadata file generated.")
+
+            # Mark complete only after all post-processing (single-reel
+            # transcription or multi-clip metadata read) is finished — see
+            # comment above. If a branch already set 'failed', don't override.
+            if jobs[job_id]['status'] != 'failed':
+                jobs[job_id]['status'] = 'completed'
         else:
             jobs[job_id]['status'] = 'failed'
             jobs[job_id]['logs'].append(f"Process failed with exit code {returncode}")
@@ -312,18 +481,32 @@ async def run_job(job_id, job_data):
 async def process_endpoint(
     request: Request,
     file: Optional[UploadFile] = File(None),
-    url: Optional[str] = Form(None)
+    url: Optional[str] = Form(None),
+    clean_video: Optional[bool] = Form(None),
+    single_reel: Optional[bool] = Form(None),
+    target_duration: Optional[int] = Form(None),
+    num_clips: Optional[int] = Form(None),
+    whisper_model: Optional[str] = Form(None),
+    whisper_language: Optional[str] = Form(None),
+    script: Optional[str] = Form(None)
 ):
     api_key = request.headers.get("X-Gemini-Key")
     if not api_key:
         raise HTTPException(status_code=400, detail="Missing X-Gemini-Key header")
-    
+
     # Handle JSON body manually for URL payload
     content_type = request.headers.get("content-type", "")
     if "application/json" in content_type:
         body = await request.json()
         url = body.get("url")
-    
+        clean_video = body.get("clean_video", False)
+        single_reel = body.get("single_reel", False)
+        target_duration = body.get("target_duration", 60)
+        num_clips = body.get("num_clips", 5)
+        whisper_model = body.get("whisper_model", "small")
+        whisper_language = body.get("whisper_language", "auto")
+        script = body.get("script") or script
+
     if not url and not file:
         raise HTTPException(status_code=400, detail="Must provide URL or File")
 
@@ -358,6 +541,30 @@ async def process_endpoint(
         cmd.extend(["-i", input_path])
 
     cmd.extend(["-o", job_output_dir])
+
+    # Add clean-video options if enabled
+    if clean_video:
+        cmd.append("--clean-video")
+    if single_reel:
+        cmd.append("--single-reel")
+    if target_duration:
+        cmd.extend(["--target-duration", str(target_duration)])
+    if num_clips:
+        cmd.extend(["--num-clips", str(num_clips)])
+    if whisper_model:
+        cmd.extend(["--whisper-model", whisper_model])
+    if whisper_language:
+        cmd.extend(["--whisper-language", whisper_language])
+
+    # Optional reference script: persist to a file and pass its path to main.py
+    if script and script.strip():
+        script_path = os.path.join(job_output_dir, "reference_script.txt")
+        try:
+            with open(script_path, "w", encoding="utf-8") as sf:
+                sf.write(script.strip())
+            cmd.extend(["--script-file", script_path])
+        except Exception as e:
+            print(f"[WARN] Could not save reference script: {e}")
 
     # Enqueue Job
     jobs[job_id] = {
@@ -471,7 +678,7 @@ async def edit_clip(
                             data = json.load(f)
                             transcript = data.get('transcript')
                 except Exception as e:
-                    print(f"⚠️ Could not load transcript for editing context: {e}")
+                    print(f"[Warning] Could not load transcript: {e}")
 
                 # 3. Get Plan (Filter String)
                 filter_data = editor.get_ffmpeg_filter(vid_file, duration, fps=fps, width=width, height=height, transcript=transcript)
@@ -516,7 +723,7 @@ async def edit_clip(
         }
 
     except Exception as e:
-        print(f"❌ Edit Error: {e}")
+        print(f"[Error] Edit failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 class SubtitleRequest(BaseModel):
@@ -530,6 +737,7 @@ class SubtitleRequest(BaseModel):
     border_width: int = 2
     bg_color: str = "#000000"
     bg_opacity: float = 0.0
+    max_words: Optional[int] = None
     input_filename: Optional[str] = None
 
 
@@ -578,6 +786,87 @@ async def get_clip_transcript(job_id: str, clip_index: int):
         "durationSec": duration_sec,
         "language": transcript.get('language', 'en'),
     }
+
+
+class SpellFixRequest(BaseModel):
+    words: List[str]
+    language: Optional[str] = None
+
+
+@app.post("/api/subtitle/fix-spelling")
+async def fix_subtitle_spelling(
+    req: SpellFixRequest,
+    x_gemini_key: Optional[str] = Header(None, alias="X-Gemini-Key"),
+):
+    """
+    Fix ONLY spelling/typo mistakes in auto-generated subtitle words using a
+    cheap Gemini model. Returns a corrected list of the SAME length and order
+    so the existing per-word timestamps stay valid.
+    """
+    final_api_key = x_gemini_key or os.environ.get("GEMINI_API_KEY")
+    if not final_api_key:
+        raise HTTPException(status_code=400, detail="Missing Gemini API Key (Header)")
+
+    words = req.words or []
+    if not words:
+        return {"words": []}
+
+    def run_fix():
+        from google import genai
+
+        # Cheapest current models first; fall back if a model id isn't enabled
+        # for this key. flash-lite is ~5x cheaper than flash.
+        model_candidates = ["gemini-2.5-flash-lite", "gemini-2.0-flash-lite", "gemini-2.5-flash"]
+
+        lang_hint = f" The language is '{req.language}'." if req.language else ""
+        prompt = (
+            "You are a subtitle spelling corrector. You are given a JSON array of "
+            "subtitle words (in spoken order). Fix ONLY spelling mistakes and obvious "
+            "speech-to-text typos, using surrounding words as context." + lang_hint + "\n\n"
+            "STRICT RULES:\n"
+            "- Return a JSON array with EXACTLY the same number of items, in the same order.\n"
+            "- Item i of your output is the corrected version of item i of the input.\n"
+            "- Do NOT merge, split, add, remove, reorder, or translate words.\n"
+            "- Keep the original casing and trailing punctuation of each word.\n"
+            "- If a word is already correct, return it unchanged.\n"
+            "- Output ONLY the JSON array, nothing else.\n\n"
+            f"INPUT ({len(words)} words):\n{json.dumps(words, ensure_ascii=False)}"
+        )
+
+        client = genai.Client(api_key=final_api_key)
+        last_err = None
+        for model_name in model_candidates:
+            try:
+                resp = client.models.generate_content(model=model_name, contents=prompt)
+                text = (resp.text or "").strip()
+                if text.startswith("```json"):
+                    text = text[7:]
+                elif text.startswith("```"):
+                    text = text[3:]
+                if text.endswith("```"):
+                    text = text[:-3]
+                text = text.strip()
+
+                fixed = json.loads(text)
+                if isinstance(fixed, list) and len(fixed) == len(words):
+                    # Coerce every item to a clean string
+                    return [str(w) for w in fixed], model_name
+                # Length mismatch — model didn't follow the contract; try next
+                last_err = f"length mismatch ({len(fixed)} vs {len(words)})"
+            except Exception as e:
+                last_err = str(e)
+                continue
+        # All attempts failed — signal caller to keep originals
+        raise RuntimeError(last_err or "spell-fix failed")
+
+    try:
+        loop = asyncio.get_event_loop()
+        fixed_words, used_model = await loop.run_in_executor(None, run_fix)
+        return {"words": fixed_words, "model": used_model}
+    except Exception as e:
+        # Non-fatal: return originals so the UI can fall back gracefully
+        print(f"[SpellFix] Failed: {e}")
+        return {"words": words, "error": str(e)}
 
 
 # --- Remotion Render Proxy ---
@@ -690,7 +979,7 @@ async def generate_effects_config(
                             data = json.load(f)
                             transcript = data.get('transcript')
                 except Exception as e:
-                    print(f"⚠️ Could not load transcript for effects config: {e}")
+                    print(f"[Warning] Could not load transcript: {e}")
 
                 # Generate effects config
                 effects_config = editor.get_effects_config(
@@ -713,7 +1002,7 @@ async def generate_effects_config(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Effects Generation Error: {e}")
+        print(f"[Error] Effects generation failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -777,14 +1066,14 @@ async def add_subtitles(req: SubtitleRequest):
         is_dubbed = filename.startswith("translated_")
 
         if is_dubbed:
-            print(f"🎙️ Dubbed video detected, transcribing audio for subtitles...")
+            print(f"[Subtitle] Dubbed video detected, transcribing...")
             def run_transcribe_srt():
-                return generate_srt_from_video(input_path, srt_path)
+                return generate_srt_from_video(input_path, srt_path, max_words=req.max_words)
 
             loop = asyncio.get_event_loop()
             success = await loop.run_in_executor(None, run_transcribe_srt)
         else:
-            success = generate_srt(transcript, clip_data['start'], clip_data['end'], srt_path)
+            success = generate_srt(transcript, clip_data['start'], clip_data['end'], srt_path, max_words=req.max_words)
 
         if not success:
              raise HTTPException(status_code=400, detail="No words found for this clip range.")
@@ -802,7 +1091,7 @@ async def add_subtitles(req: SubtitleRequest):
         await loop.run_in_executor(None, run_burn)
         
     except Exception as e:
-        print(f"❌ Subtitle Error: {e}")
+        print(f"[Error] Subtitle failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
         
     # 3. Update Result and Metadata
@@ -820,9 +1109,9 @@ async def add_subtitles(req: SubtitleRequest):
             # Write back
             with open(json_files[0], 'w') as f:
                 json.dump(data, f, indent=4)
-                print(f"✅ Metadata updated with subtitled video for clip {req.clip_index}")
+                print(f"[OK] Metadata updated with subtitled video")
     except Exception as e:
-        print(f"⚠️ Failed to update metadata.json: {e}")
+        print(f"[Warning] Failed to update metadata.json: {e}")
         # Non-critical, but good for persistence
 
     return {
@@ -837,6 +1126,8 @@ class HookRequest(BaseModel):
     input_filename: Optional[str] = None
     position: Optional[str] = "top" # top, center, bottom
     size: Optional[str] = "M" # S, M, L
+    font_path: Optional[str] = None
+    font_size: Optional[int] = None
 
 @app.post("/api/hook")
 async def add_hook(req: HookRequest):
@@ -879,17 +1170,21 @@ async def add_hook(req: HookRequest):
     # Map Size to Scale
     size_map = {"S": 0.8, "M": 1.0, "L": 1.3}
     font_scale = size_map.get(req.size, 1.0)
-    
+
     try:
         # Run in thread pool
         def run_hook():
-             add_hook_to_video(input_path, req.text, output_path, position=req.position, font_scale=font_scale)
-        
+            add_hook_to_video(
+                input_path, req.text, output_path,
+                position=req.position, font_scale=font_scale,
+                font_name=req.font_path, font_size=req.font_size,
+            )
+
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, run_hook)
         
     except Exception as e:
-        print(f"❌ Hook Error: {e}")
+        print(f"[Error] Hook failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
         
     # Update Persistence (Same logic as subtitles)
@@ -904,9 +1199,9 @@ async def add_hook(req: HookRequest):
             data['shorts'] = clips
             with open(json_files[0], 'w') as f:
                 json.dump(data, f, indent=4)
-                print(f"✅ Metadata updated with hook video for clip {req.clip_index}")
+                print(f"[OK] Metadata updated with hook video")
     except Exception as e:
-        print(f"⚠️ Failed to update metadata.json: {e}")
+        print(f"[Warning] Failed to update metadata.json: {e}")
 
     return {
         "success": True,
@@ -986,7 +1281,7 @@ async def translate_clip(
         await loop.run_in_executor(None, run_translate)
 
     except Exception as e:
-        print(f"❌ Translation Error: {e}")
+        print(f"[Error] Translation failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
     # Update InMemory Jobs
@@ -1000,9 +1295,9 @@ async def translate_clip(
             data['shorts'] = clips
             with open(json_files[0], 'w') as f:
                 json.dump(data, f, indent=4)
-                print(f"✅ Metadata updated with translated video for clip {req.clip_index}")
+                print(f"[OK] Metadata updated with translated video")
     except Exception as e:
-        print(f"⚠️ Failed to update metadata.json: {e}")
+        print(f"[Warning] Failed to update metadata.json: {e}")
 
     return {
         "success": True,
@@ -1100,13 +1395,13 @@ async def post_to_socials(req: SocialPostRequest):
             response = client.post(url, headers=headers, data=data_payload, files=files)
             
         if response.status_code not in [200, 201, 202]: # Added 201
-             print(f"❌ Upload-Post Error: {response.text}")
+             print(f"[Error] Upload-Post Error: {response.text}")
              raise HTTPException(status_code=response.status_code, detail=f"Vendor API Error: {response.text}")
 
         return response.json()
 
     except Exception as e:
-        print(f"❌ Social Post Exception: {e}")
+        print(f"[Error] Social Post Exception: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/social/user")
@@ -1123,7 +1418,7 @@ async def get_social_user(api_key: str = Header(..., alias="X-Upload-Post-Key"))
         try:
             resp = await client.get(url, headers=headers)
             if resp.status_code != 200:
-                print(f"❌ Upload-Post User Fetch Error: {resp.text}")
+                print(f"[Error] Upload-Post User Fetch Error: {resp.text}")
                 raise HTTPException(status_code=resp.status_code, detail=f"Failed to fetch user: {resp.text}")
             
             data = resp.json()
@@ -1223,9 +1518,9 @@ async def thumbnail_upload(
                 "video_duration": duration,
                 "language": transcript.get("language", "en"),
             })
-            print(f"✅ [Thumbnail] Background Whisper complete for session {session_id}")
+            print(f"[Thumbnail] Background Whisper complete")
         except Exception as e:
-            print(f"❌ [Thumbnail] Background Whisper failed: {e}")
+            print(f"[Error] Thumbnail Background Whisper failed: {e}")
             thumbnail_sessions[session_id]["transcript_error"] = str(e)
         finally:
             transcript_event.set()
@@ -1313,7 +1608,7 @@ async def thumbnail_analyze(
         }
 
     except Exception as e:
-        print(f"❌ Thumbnail Analyze Error: {e}")
+        print(f"[Error] Thumbnail Analyze failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1374,7 +1669,7 @@ async def thumbnail_titles(
         return {"titles": new_titles}
 
     except Exception as e:
-        print(f"❌ Thumbnail Titles Error: {e}")
+        print(f"[Error] Thumbnail Titles failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1442,7 +1737,7 @@ async def thumbnail_generate(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Thumbnail Generate Error: {e}")
+        print(f"[Error] Thumbnail Generate failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1482,7 +1777,7 @@ async def thumbnail_describe(
         return {"description": result.get("description", "")}
 
     except Exception as e:
-        print(f"❌ Thumbnail Describe Error: {e}")
+        print(f"[Error] Thumbnail Describe failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1549,17 +1844,17 @@ async def thumbnail_publish(
 
             if response.status_code not in [200, 201, 202]:
                 err = f"Upload-Post API Error ({response.status_code}): {response.text}"
-                print(f"❌ {err}")
+                print(f"[Error] {err}")
                 publish_jobs[publish_id]["status"] = "failed"
                 publish_jobs[publish_id]["error"] = err
             else:
-                print(f"✅ [Thumbnail] Published successfully (publish_id={publish_id})")
+                print(f"[OK] Thumbnail published (publish_id={publish_id})")
                 publish_jobs[publish_id]["status"] = "done"
                 publish_jobs[publish_id]["result"] = response.json()
 
         except Exception as e:
             err = str(e)
-            print(f"❌ Thumbnail Publish Background Error: {err}")
+            print(f"[Error] Thumbnail Publish failed: {err}")
             publish_jobs[publish_id]["status"] = "failed"
             publish_jobs[publish_id]["error"] = err
 
@@ -1603,7 +1898,7 @@ async def thumbnail_publish_status(publish_id: str):
 #             "has_more": len(all_clips) > offset + limit
 #         }
 #     except Exception as e:
-#         print(f"❌ Gallery Error: {e}")
+#         print(f"[Error] Gallery Error: {e}")
 #         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1857,7 +2152,7 @@ async def saasshorts_post_to_socials(req: SaaSPostRequest):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ [AI Shorts] Post Exception: {e}")
+        print(f"[Error] [AI Shorts] Post Exception: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -2172,7 +2467,7 @@ async def saasshorts_generate(
                     log_msg(f"⚠️ Gallery upload skipped: {gallery_err}")
 
         except Exception as e:
-            print(f"[SaaSShorts] ❌ Job {job_id} failed: {e}")
+            print(f"[SaaSShorts] Job {job_id} failed: {e}")
             if job_id in saas_jobs:
                 saas_jobs[job_id]["status"] = "failed"
                 saas_jobs[job_id]["logs"].append(f"Error: {str(e)}")
@@ -2222,3 +2517,142 @@ async def saasshorts_voices(
         ],
         "source": "defaults",
     }
+
+
+class DownloadRequest(BaseModel):
+    video_path: str
+    resolution: int  # target height (e.g. 1920, 1280, 960, 854)
+
+
+@app.post("/api/download")
+async def download_video(req: DownloadRequest):
+    """
+    Download a video at a specific resolution.
+    Uses FFmpeg to scale the video on-demand and caches the result.
+    """
+    # Normalize path — strip leading /videos/ if present
+    rel_path = req.video_path.lstrip("/")
+    if rel_path.startswith("videos/"):
+        rel_path = rel_path[len("videos/"):]
+
+    input_path = os.path.join(OUTPUT_DIR, rel_path)
+    if not os.path.exists(input_path):
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    # Cache path: same dir, filename_720p.mp4
+    base, ext = os.path.splitext(os.path.basename(input_path))
+    cache_filename = f"{base}_{req.resolution}p{ext}"
+    cache_path = os.path.join(os.path.dirname(input_path), cache_filename)
+
+    if os.path.exists(cache_path):
+        return FileResponse(cache_path, media_type="video/mp4", filename=cache_filename)
+
+    # Transcode with FFmpeg — scale by height, keep aspect ratio
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-vf", f"scale=-2:{req.resolution}",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:a", "copy",
+        "-movflags", "+faststart",
+        cache_path,
+    ]
+
+    print(f"[download] transcoding: {' '.join(cmd)}")
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode != 0:
+        err = result.stderr.decode(errors="replace")
+        print(f"[download] ffmpeg error: {err}")
+        raise HTTPException(status_code=500, detail=f"Transcode failed: {err}")
+
+    return FileResponse(cache_path, media_type="video/mp4", filename=cache_filename)
+
+
+# ---------------------------------------------------------------------------
+# System fonts
+# ---------------------------------------------------------------------------
+
+_font_cache: list = []
+
+def _scan_system_fonts() -> list:
+    """Return a list of {name, path} dicts for installed system fonts."""
+    from PIL import ImageFont
+
+    # Gather all candidate directories
+    dirs = []
+    env_dir = os.environ.get("SYSTEM_FONTS_DIR")
+    if env_dir:
+        dirs.append(env_dir)
+
+    if sys.platform == "win32":
+        dirs.append(r"C:\Windows\Fonts")
+        user_profile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+        if user_profile:
+            dirs.append(os.path.join(user_profile, r"AppData\Local\Microsoft\Windows\Fonts"))
+        dirs.append(r"C:\ProgramData\Microsoft\Windows\Fonts")
+    elif sys.platform == "darwin":
+        dirs.append("/Library/Fonts")
+        dirs.append(os.path.expanduser("~/Library/Fonts"))
+    else:
+        dirs.extend(["/usr/share/fonts", "/usr/local/share/fonts", os.path.expanduser("~/.fonts")])
+
+    seen = set()
+    fonts = []
+
+    for fonts_dir in dirs:
+        if not os.path.isdir(fonts_dir):
+            continue
+        for root, _, files in os.walk(fonts_dir):
+            for f in files:
+                ext = f.lower()
+                if not (ext.endswith(".ttf") or ext.endswith(".otf") or ext.endswith(".ttc")):
+                    continue
+                path = os.path.join(root, f)
+                # Try to load the font and extract a family name
+                candidates = []
+                if ext.endswith(".ttc"):
+                    # TTC may contain multiple faces — try first few indices
+                    for idx in range(0, 4):
+                        try:
+                            font = ImageFont.truetype(path, 12, index=idx)
+                            name = (font.getname()[0] or "").strip()
+                            if not name:
+                                name = (font.getname()[1] or "").strip()
+                            if name:
+                                candidates.append(name)
+                        except Exception:
+                            break
+                else:
+                    try:
+                        font = ImageFont.truetype(path, 12)
+                        name = (font.getname()[0] or "").strip()
+                        if not name:
+                            name = (font.getname()[1] or "").strip()
+                        if name:
+                            candidates.append(name)
+                    except Exception:
+                        # Last resort: derive a readable name from filename
+                        base = os.path.splitext(f)[0]
+                        base = base.replace("_", " ").replace("-", " ")
+                        # Title-case heuristic
+                        name = " ".join([w.capitalize() for w in base.split()])
+                        candidates.append(name)
+
+                for name in candidates:
+                    if not name:
+                        continue
+                    key = name.lower()
+                    if key not in seen:
+                        seen.add(key)
+                        fonts.append({"name": name, "path": path})
+
+    return sorted(fonts, key=lambda x: x["name"].lower())
+
+
+@app.get("/api/fonts")
+async def list_fonts():
+    """Return installed system fonts as {name, path}."""
+    global _font_cache
+    if not _font_cache:
+        _font_cache = _scan_system_fonts()
+    return {"fonts": _font_cache}

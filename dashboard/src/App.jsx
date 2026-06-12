@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Upload, FileVideo, Sparkles, Youtube, Instagram, Share2, LogOut, ChevronDown, Check, Activity, LayoutDashboard, Settings, PlusCircle, History, Menu, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar } from 'lucide-react';
+import { Upload, FileVideo, Sparkles, Youtube, Instagram, Share2, LogOut, ChevronDown, Check, Activity, LayoutDashboard, Settings, PlusCircle, History, Menu, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertCircle } from 'lucide-react';
 import KeyInput from './components/KeyInput';
 import MediaInput from './components/MediaInput';
 import ResultCard from './components/ResultCard';
@@ -336,10 +336,28 @@ function App() {
 
       if (data.type === 'url') {
         headers['Content-Type'] = 'application/json';
-        body = JSON.stringify({ url: data.payload });
+        body = JSON.stringify({
+          url: data.payload,
+          clean_video: data.cleanVideo || false,
+          single_reel: data.singleReel || false,
+          target_duration: data.targetDuration || null,
+          num_clips: data.numClips || 5,
+          script: data.script || null
+        });
       } else {
         const formData = new FormData();
         formData.append('file', data.payload);
+        formData.append('clean_video', data.cleanVideo || false);
+        formData.append('single_reel', data.singleReel || false);
+        if (data.targetDuration) {
+          formData.append('target_duration', String(data.targetDuration));
+        }
+        if (data.numClips) {
+          formData.append('num_clips', String(data.numClips));
+        }
+        if (data.script && data.script.trim()) {
+          formData.append('script', data.script.trim());
+        }
         body = formData;
       }
 
@@ -786,7 +804,7 @@ function App() {
               <div className={`${status === 'complete' ? 'w-full md:w-[70%] lg:w-[75%]' : 'w-full md:w-[45%] lg:w-[40%]'} h-full flex flex-col bg-background p-6 transition-all duration-700 ease-in-out`}>
                 <h2 className="text-lg font-semibold mb-6 flex items-center gap-2 shrink-0">
                   <Sparkles className="text-yellow-400" size={20} />
-                  Generated Shorts
+                  {results?.single_reel ? 'Polished Reel' : 'Generated Shorts'}
                   {results?.clips?.length > 0 && (
                     <span className="text-xs bg-white/10 text-white px-2 py-0.5 rounded-full ml-auto">
                       {results.clips.length} Clips
@@ -810,7 +828,16 @@ function App() {
 
                 <div className="flex-1 overflow-y-auto custom-scrollbar p-1">
                   {results && results.clips && results.clips.length > 0 ? (
-                    <div className={`grid gap-4 pb-10 ${status === 'complete' ? 'grid-cols-1 xl:grid-cols-2' : 'grid-cols-1'}`}>
+                    // Show clip grid. Single reel mode produces a 1-entry clips
+                    // array with metadata + transcript on the backend, so it gets
+                    // the same Subtitles / Hook / Auto Edit / Dub / Post buttons
+                    // as a multi-clip job.
+                    <div className={`grid gap-4 pb-10 ${results.single_reel
+                        ? 'grid-cols-1 max-w-3xl mx-auto'
+                        : status === 'complete'
+                          ? 'grid-cols-1 xl:grid-cols-2'
+                          : 'grid-cols-1'
+                      }`}>
                       {results.clips.map((clip, i) => (
                         <ResultCard
                           key={i}
@@ -825,6 +852,33 @@ function App() {
                           onPause={handleClipPause}
                         />
                       ))}
+                    </div>
+                  ) : results?.single_reel && results?.video_url ? (
+                    // Legacy fallback: reel succeeded but transcription failed,
+                    // so editing endpoints aren't wired up — just show the player.
+                    <div className="grid gap-4 pb-10 max-w-2xl mx-auto">
+                      <div className="bg-surface border border-white/10 rounded-xl overflow-hidden">
+                        <video
+                          src={`${getApiUrl(results.video_url)}`}
+                          controls
+                          className="w-full aspect-[9/16] max-h-[500px] bg-black"
+                          autoPlay
+                          loop
+                        />
+                        <div className="p-4 space-y-3">
+                          <div className="flex items-center gap-2 text-sm text-amber-400">
+                            <AlertCircle size={16} />
+                            <span className="font-medium">Reel ready — editing tools unavailable (transcription failed)</span>
+                          </div>
+                          <a
+                            href={`${getApiUrl(results.video_url)}`}
+                            download
+                            className="block btn-primary py-2 px-4 text-center text-sm"
+                          >
+                            Download Reel
+                          </a>
+                        </div>
+                      </div>
                     </div>
                   ) : (
                     status === 'processing' ? (

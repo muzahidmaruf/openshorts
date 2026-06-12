@@ -1,5 +1,6 @@
-import React, { useState } from 'react';
-import { X, Sparkles, Loader2, Maximize, MoveVertical, Zap } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { X, Sparkles, Loader2, Maximize, MoveVertical, Zap, Type } from 'lucide-react';
+import { getApiUrl } from '../config';
 import RemotionPreview from './RemotionPreview';
 
 const ENTRANCE_OPTIONS = [
@@ -15,6 +16,30 @@ export default function HookModal({ isOpen, onClose, onGenerate, isProcessing, v
     const [size, setSize] = useState('M');
     const [entranceAnimation, setEntranceAnimation] = useState('spring');
     const [displayDuration, setDisplayDuration] = useState(5);
+    const [fontName, setFontName] = useState('Noto Serif');
+    const [fontPath, setFontPath] = useState('');
+    const [fontSize, setFontSize] = useState(22);
+    const [systemFonts, setSystemFonts] = useState([]);
+    const [fontsLoading, setFontsLoading] = useState(false);
+
+    useEffect(() => {
+        if (!isOpen) return;
+        setFontsLoading(true);
+        fetch(getApiUrl('/api/fonts'))
+            .then((res) => res.ok ? res.json() : null)
+            .then((data) => {
+                if (data && data.fonts && data.fonts.length > 0) {
+                    setSystemFonts(data.fonts);
+                    // Auto-select first font if none set
+                    if (!fontPath && data.fonts[0]) {
+                        setFontName(data.fonts[0].name);
+                        setFontPath(data.fonts[0].path);
+                    }
+                }
+            })
+            .catch(() => {})
+            .finally(() => setFontsLoading(false));
+    }, [isOpen]);
 
     if (!isOpen) return null;
 
@@ -25,11 +50,13 @@ export default function HookModal({ isOpen, onClose, onGenerate, isProcessing, v
         size,
         entranceAnimation,
         displayDurationSec: displayDuration,
+        fontName,
+        fontSize,
     };
 
     const useRemotionPreview = !!videoUrl;
 
-    // Fallback preview logic (same as original)
+    // Fallback preview logic
     const getPositionClass = () => {
         switch (position) {
             case 'center': return 'items-center justify-center';
@@ -40,9 +67,9 @@ export default function HookModal({ isOpen, onClose, onGenerate, isProcessing, v
 
     const getSizeStyle = () => {
         switch (size) {
-            case 'S': return { fontSize: '14px', maxWidth: '80%' };
-            case 'L': return { fontSize: '24px', maxWidth: '95%' };
-            case 'M': default: return { fontSize: '18px', maxWidth: '90%' };
+            case 'S': return { fontSize: `${Math.round(fontSize * 0.7)}px`, maxWidth: '80%' };
+            case 'L': return { fontSize: `${Math.round(fontSize * 1.3)}px`, maxWidth: '95%' };
+            case 'M': default: return { fontSize: `${fontSize}px`, maxWidth: '90%' };
         }
     };
 
@@ -74,7 +101,7 @@ export default function HookModal({ isOpen, onClose, onGenerate, isProcessing, v
                                     style={{
                                         ...getSizeStyle(),
                                         backgroundColor: 'rgba(255, 255, 255, 0.82)',
-                                        fontFamily: 'Noto Serif, serif',
+                                        fontFamily: `"${fontName}", serif`,
                                         boxShadow: '0 4px 15px rgba(0,0,0,0.5)',
                                         paddingTop: '10px',
                                         paddingBottom: '10px',
@@ -95,7 +122,7 @@ export default function HookModal({ isOpen, onClose, onGenerate, isProcessing, v
                         <Sparkles className="text-yellow-400" /> Viral Hook
                     </h3>
 
-                    <div className="space-y-6 flex-1 overflow-y-auto custom-scrollbar pr-2">
+                    <div className="space-y-5 flex-1 overflow-y-auto custom-scrollbar pr-2">
                         {/* Text Input */}
                         <div>
                             <label className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-3 block">Text</label>
@@ -103,9 +130,56 @@ export default function HookModal({ isOpen, onClose, onGenerate, isProcessing, v
                                 value={text}
                                 onChange={(e) => setText(e.target.value)}
                                 rows={4}
-                                className="w-full bg-black/40 border border-white/10 rounded-xl p-3 text-white placeholder-zinc-600 focus:outline-none focus:border-yellow-500/50 resize-none font-serif"
+                                className="w-full bg-black/40 border border-white/10 rounded-xl p-3 text-white placeholder-zinc-600 focus:outline-none focus:border-yellow-500/50 resize-none"
+                                style={{ fontFamily: `"${fontName}", serif` }}
                                 placeholder="Enter text that will stop the scroll..."
                             />
+                        </div>
+
+                        {/* Font Family */}
+                        <div>
+                            <label className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Font</label>
+                            <select
+                                value={fontPath}
+                                onChange={(e) => {
+                                    const path = e.target.value;
+                                    const match = systemFonts.find((f) => f.path === path);
+                                    setFontPath(path);
+                                    if (match) setFontName(match.name);
+                                }}
+                                className="w-full bg-black/40 border border-white/10 rounded-lg p-2 text-sm text-white focus:outline-none focus:border-primary/50"
+                            >
+                                {fontsLoading && systemFonts.length === 0 && (
+                                    <option value={fontPath}>{fontName}</option>
+                                )}
+                                {systemFonts.map((f) => (
+                                    <option key={f.path} value={f.path} style={{ fontFamily: f.name }}>{f.name}</option>
+                                ))}
+                            </select>
+                        </div>
+
+                        {/* Font Size */}
+                        <div>
+                            <label className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">
+                                Font Size: {fontSize}px
+                            </label>
+                            <div className="flex items-center gap-3">
+                                <span className="text-[10px] text-zinc-500">14</span>
+                                <input
+                                    type="range"
+                                    min="14"
+                                    max="72"
+                                    step="2"
+                                    value={fontSize}
+                                    onChange={(e) => setFontSize(parseInt(e.target.value))}
+                                    className="w-full accent-yellow-500"
+                                />
+                                <span className="text-[10px] text-zinc-500">72</span>
+                            </div>
+                            <div className="flex justify-between text-[10px] text-zinc-500 mt-1">
+                                <span>Small</span>
+                                <span>Large</span>
+                            </div>
                         </div>
 
                         {/* Position Control */}
@@ -150,7 +224,7 @@ export default function HookModal({ isOpen, onClose, onGenerate, isProcessing, v
                             </div>
                         </div>
 
-                        {/* Entrance Animation (new) */}
+                        {/* Entrance Animation */}
                         <div>
                             <label className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-3 flex items-center gap-2">
                                 <Zap size={12} /> Entrance
@@ -171,7 +245,7 @@ export default function HookModal({ isOpen, onClose, onGenerate, isProcessing, v
                             </div>
                         </div>
 
-                        {/* Display Duration (new) */}
+                        {/* Display Duration */}
                         <div>
                             <label className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Duration: {displayDuration}s</label>
                             <input
@@ -195,7 +269,7 @@ export default function HookModal({ isOpen, onClose, onGenerate, isProcessing, v
 
                     <button
                         onClick={() => onGenerate({
-                            text, position, size,
+                            text, position, size, fontName, fontSize,
                             // Remotion data
                             remotion: hookConfig,
                         })}

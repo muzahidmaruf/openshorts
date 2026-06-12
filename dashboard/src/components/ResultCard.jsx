@@ -4,13 +4,18 @@ import { getApiUrl } from '../config';
 import SubtitleModal from './SubtitleModal';
 import HookModal from './HookModal';
 import TranslateModal from './TranslateModal';
+import DownloadModal from './DownloadModal';
 import { renderInBrowser } from '../lib/renderInBrowser';
 
 export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUserId, geminiApiKey, elevenLabsKey, onPlay, onPause }) {
     const [showModal, setShowModal] = useState(false);
     const [showSubtitleModal, setShowSubtitleModal] = useState(false);
     const videoRef = React.useRef(null);
-    const originalVideoUrl = getApiUrl(clip.video_url); // Never changes — used for Remotion previews
+    // Ensure absolute URL for Remotion (relative URLs fail in render worker)
+    const _rawUrl = getApiUrl(clip.video_url);
+    const originalVideoUrl = _rawUrl.startsWith('http')
+        ? _rawUrl
+        : `${window.location.protocol}//${window.location.hostname}:8000${_rawUrl}`;
     const [currentVideoUrl, setCurrentVideoUrl] = useState(originalVideoUrl);
 
     const [platforms, setPlatforms] = useState({
@@ -32,6 +37,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
     const [isTranslating, setIsTranslating] = useState(false);
     const [showHookModal, setShowHookModal] = useState(false);
     const [showTranslateModal, setShowTranslateModal] = useState(false);
+    const [showDownloadModal, setShowDownloadModal] = useState(false);
     const [editError, setEditError] = useState(null);
 
     const [clipDuration, setClipDuration] = useState(clip.end && clip.start ? clip.end - clip.start : 30);
@@ -170,6 +176,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                     border_width: options.borderWidth,
                     bg_color: options.bgColor,
                     bg_opacity: options.bgOpacity,
+                    max_words: options.max_words,
                     input_filename: currentVideoUrl.split('/').pop()
                 })
             });
@@ -224,6 +231,8 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                     text: payload.text,
                     position: payload.position,
                     size: payload.size,
+                    font_path: payload.fontPath || null,
+                    font_size: payload.fontSize || null,
                     input_filename: currentVideoUrl.split('/').pop()
                 })
             });
@@ -503,26 +512,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                         <Share2 size={14} className="shrink-0" /> Post
                     </button>
                     <button
-                        onClick={async (e) => {
-                            e.preventDefault();
-                            try {
-                                const response = await fetch(currentVideoUrl);
-                                if (!response.ok) throw new Error('Download failed');
-                                const blob = await response.blob();
-                                const url = window.URL.createObjectURL(blob);
-                                const a = document.createElement('a');
-                                a.style.display = 'none';
-                                a.href = url;
-                                a.download = `clip-${index + 1}.mp4`;
-                                document.body.appendChild(a);
-                                a.click();
-                                window.URL.revokeObjectURL(url);
-                                document.body.removeChild(a);
-                            } catch (err) {
-                                console.error('Download error:', err);
-                                window.open(currentVideoUrl, '_blank');
-                            }
-                        }}
+                        onClick={() => setShowDownloadModal(true)}
                         className="col-span-1 py-2 bg-white/5 hover:bg-white/10 text-zinc-300 hover:text-white rounded-lg text-xs font-medium transition-colors flex items-center justify-center gap-2 border border-white/5 truncate px-2"
                     >
                         <Download size={14} className="shrink-0" /> Download
@@ -648,6 +638,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                 videoUrl={originalVideoUrl}
                 jobId={jobId}
                 clipIndex={index}
+                geminiApiKey={geminiApiKey}
                 existingHook={activeLayers.hook}
             />
 
@@ -669,6 +660,13 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                 isProcessing={isTranslating}
                 videoUrl={currentVideoUrl}
                 hasApiKey={!!elevenLabsKey}
+            />
+
+            <DownloadModal
+                isOpen={showDownloadModal}
+                onClose={() => setShowDownloadModal(false)}
+                videoUrl={currentVideoUrl}
+                filename={`clip-${index + 1}.mp4`}
             />
 
         </div>
